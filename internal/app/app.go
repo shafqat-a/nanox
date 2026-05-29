@@ -9,6 +9,7 @@ import (
 	"dosedit/internal/ui"
 
 	"github.com/epiclabs-io/winman"
+	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 )
 
@@ -73,6 +74,34 @@ func New(tapp *tview.Application, desktop *ui.Desktop, statusbar *ui.StatusBar) 
 	menubar.SetOnClose(func() {
 		a.statusbar.SetContext(ui.CtxEditing)
 		a.focusActiveEditor()
+	})
+
+	// When the menu bar becomes active (keyboard or mouse), switch the status
+	// bar to the menu context.
+	menubar.SetOnActivate(func() {
+		a.statusbar.SetContext(ui.CtxMenu)
+	})
+
+	// Mouse support for the menu bar. The open dropdown is drawn below row 0 and
+	// thus outside the MenuBar primitive's rect, so tview's per-primitive routing
+	// never delivers dropdown clicks to it. Capture mouse events at the app level
+	// and hit-test them against the bar in absolute coordinates. Only events the
+	// menu actually handles are swallowed; everything else passes through so
+	// winman window drag/resize and the editor keep working.
+	tapp.SetMouseCapture(func(ev *tcell.EventMouse, action tview.MouseAction) (*tcell.EventMouse, tview.MouseAction) {
+		if a.modalOpen {
+			return ev, action
+		}
+		x, y := ev.Position()
+		if a.menubar.HandleMouse(action, x, y) {
+			// The bar consumed it. If it became active, give it keyboard focus so
+			// arrow-key navigation takes over.
+			if a.menubar.IsActive() {
+				a.tapp.SetFocus(a.menubar)
+			}
+			return nil, action
+		}
+		return ev, action
 	})
 
 	return a

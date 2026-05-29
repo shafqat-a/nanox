@@ -1217,6 +1217,157 @@ func (e *Editor) ReplaceAll(find, repl string, matchCase, wholeWord bool) int {
 	return count
 }
 
+// --- mouse support (appended) ---------------------------------------------
+
+// edMouseScrollLines is how many lines a single wheel notch scrolls.
+const edMouseScrollLines = 3
+
+// edVisualToCol converts a visual/display column on a line back to a rune
+// index, mirroring Draw's tab-expansion geometry (tabs advance to the next
+// multiple of edTabWidth). It returns the rune index whose start is nearest the
+// requested visual column, clamped to [0, len(line)]. A click on the trailing
+// half of a wide cell (e.g. an expanded tab) lands on the following rune.
+func (e *Editor) edVisualToCol(line, visCol int) int {
+	if visCol <= 0 {
+		return 0
+	}
+	rs := e.edLineRunes(line)
+	tw := e.edTabWidth()
+	dc := 0
+	for i := 0; i < len(rs); i++ {
+		var w int
+		if rs[i] == '\t' {
+			w = tw - (dc % tw)
+		} else {
+			w = 1
+		}
+		// If the target column falls within this cell, choose the nearer edge.
+		if visCol < dc+w {
+			if visCol-dc >= (w+1)/2 {
+				return i + 1
+			}
+			return i
+		}
+		dc += w
+	}
+	return len(rs)
+}
+
+// edMousePos maps an absolute screen (x,y) from a mouse event to a clamped
+// document position, mirroring Draw's geometry: docLine = topLine + (y-innerY)
+// and visual col = leftCol + (x-innerX). Clicking past the last line lands on
+// the last line; past end-of-line lands on the line end.
+func (e *Editor) edMousePos(x, y int) (line, col int) {
+	innerX, innerY, _, _ := e.GetInnerRect()
+	line = e.topLine + (y - innerY)
+	line = edClamp(line, 0, e.buf.LineCount()-1)
+	visCol := e.leftCol + (x - innerX)
+	col = e.edVisualToCol(line, visCol)
+	col = edClamp(col, 0, e.edLineLen(line))
+	return line, col
+}
+
+// edScrollToCursor re-runs the visibility/scroll-adjust logic using the current
+// text-area dimensions (mirroring Draw's scrollbar reservation), so cursor
+// moves triggered by the mouse keep the caret on screen.
+func (e *Editor) edScrollToCursor() {
+	_, _, w, h := e.GetInnerRect()
+	if w <= 0 || h <= 0 {
+		return
+	}
+	lineCount := e.buf.LineCount()
+	maxWidth := 0
+	for i := 0; i < lineCount; i++ {
+		if dw := e.edLineDisplayWidth(i); dw > maxWidth {
+			maxWidth = dw
+		}
+	}
+	textW, textH := w, h
+	needV := lineCount > textH
+	needH := maxWidth > textW
+	if needV {
+		textW = w - 1
+	}
+	if needH {
+		textH = h - 1
+	}
+	if !needV && lineCount > textH {
+		needV = true
+		textW = w - 1
+	}
+	if !needH && maxWidth > textW {
+		needH = true
+		textH = h - 1
+	}
+	if textW < 1 {
+		textW = 1
+	}
+	if textH < 1 {
+		textH = 1
+	}
+	e.edScrollToCursorWith(textW, textH)
+}
+
+// MouseHandler implements mouse-driven cursor positioning, drag selection and
+// wheel scrolling for the editor. It honours any installed mouse-capture hook
+// (via WrapMouseHandler) and returns the editor as the capture primitive while
+// a left-drag is in progress so subsequent MouseMove events continue to extend
+// the selection even if the pointer leaves the inner rect.
+func (e *Editor) MouseHandler() func(action tview.MouseAction, event *tcell.EventMouse, setFocus func(p tview.Primitive)) (consumed bool, capture tview.Primitive) {
+	return e.WrapMouseHandler(func(action tview.MouseAction, event *tcell.EventMouse, setFocus func(p tview.Primitive)) (consumed bool, capture tview.Primitive) {
+		x, y := event.Position()
+
+		switch action {
+		case tview.MouseLeftDown:
+			if !e.InRect(x, y) {
+				return false, nil
+			}
+			setFocus(e)
+			line, col := e.edMousePos(x, y)
+			e.curLine, e.curCol = line, col
+			e.edClampCursor()
+			// Begin a fresh selection anchored at the click point. Drag will
+			// extend it; a plain click leaves it empty (no selection).
+			e.selAnchor = &edPos{Line: e.curLine, Col: e.curCol}
+			e.edScrollToCursor()
+			e.edNotifyCursor()
+			// Capture follow-up move/up events so a drag keeps coming to us.
+			return true, e
+
+		case tview.MouseMove:
+			// Only act on motion while the left button is held (a drag).
+			if event.Buttons()&tcell.ButtonPrimary == 0 || e.selAnchor == nil {
+				return false, nil
+			}
+			line, col := e.edMousePos(x, y)
+			e.curLine, e.curCol = line, col
+			e.edClampCursor()
+			e.edScrollToCursor()
+			e.edNotifyCursor()
+			return true, e
+
+		case tview.MouseLeftUp:
+			// End of a drag: drop the anchor if nothing was actually selected.
+			if e.selAnchor != nil && !e.edHasSelection() {
+				e.edClearSelection()
+			}
+			e.edNotifyCursor()
+			return true, nil
+
+		case tview.MouseScrollUp:
+			e.topLine = edMax(0, e.topLine-edMouseScrollLines)
+			return true, nil
+
+		case tview.MouseScrollDown:
+			maxTop := edMax(0, e.buf.LineCount()-1)
+			e.topLine = edMin(maxTop, e.topLine+edMouseScrollLines)
+			return true, nil
+		}
+
+		return false, nil
+	})
+}
+
 // GotoLine moves the cursor to the start of 1-based line n, clamped to the
 // document, and scrolls it into view.
 func (e *Editor) GotoLine(n int) {

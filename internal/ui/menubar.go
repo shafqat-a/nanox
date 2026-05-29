@@ -31,12 +31,13 @@ type Menu struct {
 type MenuBar struct {
 	*tview.Box
 
-	mbMenus   []*Menu
-	mbActive  bool // bar has focus
-	mbOpen    bool // a dropdown is open
-	mbSel     int  // index into mbMenus of the highlighted/open top-level menu
-	mbItem    int  // index into the open menu's Items of the highlighted row
-	mbOnClose func()
+	mbMenus      []*Menu
+	mbActive     bool // bar has focus
+	mbOpen       bool // a dropdown is open
+	mbSel        int  // index into mbMenus of the highlighted/open top-level menu
+	mbItem       int  // index into the open menu's Items of the highlighted row
+	mbOnClose    func()
+	mbOnActivate func()
 }
 
 // NewMenuBar builds a menu bar over the supplied menus.
@@ -59,6 +60,7 @@ func (m *MenuBar) Activate() {
 	m.mbOpen = false
 	m.mbSel = 0
 	m.mbItem = 0
+	m.mbFireActivate()
 }
 
 // OpenByMnemonic activates the bar and opens the menu whose mnemonic matches r.
@@ -69,6 +71,7 @@ func (m *MenuBar) OpenByMnemonic(r rune) bool {
 		if unicode.ToLower(mn.Mnemonic) == r {
 			m.mbActive = true
 			m.mbSel = i
+			m.mbFireActivate()
 			m.mbOpenMenu()
 			return true
 		}
@@ -78,6 +81,18 @@ func (m *MenuBar) OpenByMnemonic(r rune) bool {
 
 // SetOnClose registers the callback fired when the bar fully closes.
 func (m *MenuBar) SetOnClose(fn func()) { m.mbOnClose = fn }
+
+// SetOnActivate registers the callback fired when the bar becomes active (so the
+// app can switch the status bar to the menu context). It fires on both keyboard
+// and mouse activation.
+func (m *MenuBar) SetOnActivate(fn func()) { m.mbOnActivate = fn }
+
+// mbFireActivate invokes the activation callback if one is registered.
+func (m *MenuBar) mbFireActivate() {
+	if m.mbOnActivate != nil {
+		m.mbOnActivate()
+	}
+}
 
 // IsActive reports whether the bar currently holds focus.
 func (m *MenuBar) IsActive() bool { return m.mbActive }
@@ -197,6 +212,26 @@ func (m *MenuBar) mbTitleX(i int) (int, int) {
 	return cur, 0
 }
 
+// mbDropBounds returns the open dropdown's box geometry for menu i, in absolute
+// screen coordinates: the box's top-left corner (bx,by), the inner content width
+// and the box's outer width/height (including borders). Draw and hit-testing
+// share this so the visible box and the clickable region stay identical.
+func (m *MenuBar) mbDropBounds(i int) (bx, by, inner, boxW, boxH int) {
+	x, y, _, _ := m.GetRect()
+	tx, _ := m.mbTitleX(i)
+	// Anchor the box so its left border sits one cell left of the title text,
+	// keeping the title visually attached. Clamp to the bar's left edge.
+	bx = tx - 1
+	if bx < x {
+		bx = x
+	}
+	by = y + 1
+	inner = m.mbDropWidth(i)
+	boxW = inner + 2 // borders
+	boxH = len(m.mbMenus[i].Items) + 2
+	return bx, by, inner, boxW, boxH
+}
+
 // mbDropWidth returns the inner content width of menu i's dropdown.
 func (m *MenuBar) mbDropWidth(i int) int {
 	maxLabel := 0
@@ -276,20 +311,8 @@ func (m *MenuBar) mbDrawTitle(screen tcell.Screen, i, y int) {
 
 // mbDrawDropdown renders the open menu's dropdown box with shadow.
 func (m *MenuBar) mbDrawDropdown(screen tcell.Screen) {
-	x, y, _, _ := m.GetRect()
-	tx, _ := m.mbTitleX(m.mbSel)
-	// Anchor the box so its left border sits one cell left of the title text,
-	// keeping the title visually attached. Clamp to the bar's left edge.
-	bx := tx - 1
-	if bx < x {
-		bx = x
-	}
-	by := y + 1
-
-	inner := m.mbDropWidth(m.mbSel)
+	bx, by, inner, boxW, boxH := m.mbDropBounds(m.mbSel)
 	items := m.mbMenus[m.mbSel].Items
-	boxW := inner + 2 // borders
-	boxH := len(items) + 2
 
 	body := theme.DropdownBody()
 
@@ -420,6 +443,129 @@ func (m *MenuBar) InputHandler() func(event *tcell.EventKey, setFocus func(p tvi
 			m.mbHandleRune(event.Rune())
 		}
 	})
+}
+
+// HandleMouse processes a mouse action at the absolute screen position (x,y).
+// It is driven from the application's mouse capture rather than tview's normal
+// per-primitive routing, because the open dropdown is drawn below row 0 and so
+// lies outside this primitive's rect. Returns true when the event was handled
+// (and should be swallowed by the caller).
+//
+// Behaviour for a left button-down / click:
+//   - on a top-level title: activate the bar and open that menu.
+//   - inside the open dropdown on a selectable row: run its action and close.
+//   - inside the open dropdown on a separator/disabled row: ignore (consume).
+//   - anywhere else while active/open: close the menu and consume the click.
+//
+// A hover (MouseMove) over a dropdown row or top-level title updates the
+// highlight while the bar is open, but is not itself consumed.
+func (m *MenuBar) HandleMouse(action tview.MouseAction, x, y int) bool {
+	if len(m.mbMenus) == 0 {
+		return false
+	}
+
+	switch action {
+	case tview.MouseMove:
+		return m.mbHandleHover(x, y)
+	case tview.MouseLeftDown, tview.MouseLeftClick:
+		// fall through to handling below.
+	default:
+		return false
+	}
+
+	// Click on a top-level title row.
+	if i, ok := m.mbHitTitle(x, y); ok {
+		m.mbActive = true
+		m.mbSel = i
+		m.mbFireActivate()
+		m.mbOpenMenu()
+		return true
+	}
+
+	// Click inside the open dropdown.
+	if m.mbOpen {
+		if row, ok := m.mbHitDropRow(x, y); ok {
+			items := m.mbMenus[m.mbSel].Items
+			if row >= 0 && row < len(items) {
+				it := items[row]
+				if it.Separator || it.Disabled {
+					return true // inside the box but not actionable: just consume.
+				}
+				m.mbItem = row
+				m.mbActivateItem()
+			}
+			return true
+		}
+	}
+
+	// Active or open, but the click landed outside both the bar and the
+	// dropdown: dismiss (same as Esc-to-closed) and consume the click.
+	if m.mbActive || m.mbOpen {
+		m.mbClose()
+		return true
+	}
+
+	return false
+}
+
+// mbHandleHover updates the highlight under the cursor while the bar is open. It
+// does not consume the event.
+func (m *MenuBar) mbHandleHover(x, y int) bool {
+	if !m.mbActive {
+		return false
+	}
+	if i, ok := m.mbHitTitle(x, y); ok {
+		if i != m.mbSel {
+			m.mbSel = i
+			if m.mbOpen {
+				m.mbOpenMenu()
+			}
+		}
+		return false
+	}
+	if m.mbOpen {
+		if row, ok := m.mbHitDropRow(x, y); ok {
+			items := m.mbMenus[m.mbSel].Items
+			if row >= 0 && row < len(items) && !items[row].Separator && !items[row].Disabled {
+				m.mbItem = row
+			}
+		}
+	}
+	return false
+}
+
+// mbHitTitle reports the index of the top-level title whose cells contain (x,y),
+// when (x,y) is on the bar row.
+func (m *MenuBar) mbHitTitle(x, y int) (int, bool) {
+	_, by, _, _ := m.GetRect()
+	if y != by {
+		return 0, false
+	}
+	for i := range m.mbMenus {
+		tx, tw := m.mbTitleX(i)
+		if tw > 0 && x >= tx && x < tx+tw {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+// mbHitDropRow reports the item-row index of the open dropdown that contains
+// (x,y), when (x,y) is inside the dropdown's inner area.
+func (m *MenuBar) mbHitDropRow(x, y int) (int, bool) {
+	if !m.mbOpen {
+		return 0, false
+	}
+	bx, by, _, boxW, boxH := m.mbDropBounds(m.mbSel)
+	if x < bx || x >= bx+boxW || y < by || y >= by+boxH {
+		return 0, false
+	}
+	// Rows sit between the top border (by) and bottom border (by+boxH-1).
+	row := y - (by + 1)
+	if row < 0 || row >= len(m.mbMenus[m.mbSel].Items) {
+		return 0, false
+	}
+	return row, true
 }
 
 // mbHandleRune handles a typed mnemonic letter.
