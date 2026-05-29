@@ -57,6 +57,18 @@ func dlgMaxInt(a, b int) int {
 	return b
 }
 
+// dlgBodyRows returns the number of body rows a single-line / multi-line control
+// should occupy when stacked vertically (a RadioGroup needs one row per option;
+// everything else takes one row).
+func dlgBodyRows(p tview.Primitive) int {
+	if rg, ok := p.(*RadioGroup); ok {
+		if n := rg.OptionCount(); n > 0 {
+			return n
+		}
+	}
+	return 1
+}
+
 // ----------------------------------------------------------------------------
 // Dialog: the unified modal primitive
 // ----------------------------------------------------------------------------
@@ -74,15 +86,15 @@ type Dialog struct {
 	// stacked vertically in the left/main body area. buttons holds the command
 	// buttons, stacked vertically down the right-hand side.
 	body    []tview.Primitive
-	buttons []*tview.Button
+	buttons []*Button
 
 	// ring is the flat ordered focus ring: focusable body controls followed by
 	// the buttons. index is the currently focused entry.
 	ring  []tview.Primitive
 	index int
 
-	def    *tview.Button // Enter target; first button if unset
-	cancel func()        // Esc / Cancel action
+	def    *Button // Enter target; first button if unset
+	cancel func()  // Esc / Cancel action
 
 	width, height int
 }
@@ -117,7 +129,12 @@ func (d *Dialog) SetCancel(fn func()) {
 }
 
 // SetDefault sets the button activated by Enter when focus is not on a button.
-func (d *Dialog) SetDefault(b *tview.Button) {
+// It also marks that button as the default so it renders with the black outline
+// (per spec §4.3) even when it is not the focused control.
+func (d *Dialog) SetDefault(b *Button) {
+	for _, x := range d.buttons {
+		x.SetDefaultButton(x == b)
+	}
 	d.def = b
 }
 
@@ -149,7 +166,9 @@ func (d *Dialog) rebuildRing() {
 // ----------------------------------------------------------------------------
 
 // AddField adds a labelled white-on-black input field to the body and returns
-// it so callers can read the value.
+// it so callers can read the value. The field is given a yellow cursor (spec
+// §4.3); the Dialog draws a recessed single-line frame around the field's text
+// region (see dlgDrawFieldFrame).
 func (d *Dialog) AddField(label, value string, fieldWidth int) *tview.InputField {
 	in := tview.NewInputField()
 	in.SetLabel(label)
@@ -163,18 +182,24 @@ func (d *Dialog) AddField(label, value string, fieldWidth int) *tview.InputField
 	return in
 }
 
-// AddCheckbox adds a labelled checkbox to the body and returns it.
-func (d *Dialog) AddCheckbox(label string, checked bool) *tview.Checkbox {
-	cb := tview.NewCheckbox()
-	cb.SetLabel(label + " ")
-	cb.SetChecked(checked)
-	cb.SetLabelColor(theme.Black)
-	cb.SetFieldTextColor(theme.White)
-	cb.SetFieldBackgroundColor(theme.Black)
-	cb.SetBackgroundColor(theme.LGray)
+// AddCheckbox adds a labelled VB-for-DOS checkbox ("[ ] Label" / "[X] Label")
+// to the body and returns it. The returned *Checkbox exposes IsChecked() for the
+// constructors that read its value.
+func (d *Dialog) AddCheckbox(label string, checked bool) *Checkbox {
+	cb := NewCheckbox(label, checked)
 	d.body = append(d.body, cb)
 	d.rebuildRing()
 	return cb
+}
+
+// AddRadioGroup adds a vertical option-button group ("( ) Label" / "(•) Label")
+// to the body and returns it. Exactly one option is selected; callers read the
+// choice via Selected()/SelectedLabel().
+func (d *Dialog) AddRadioGroup(options []string, selected int) *RadioGroup {
+	rg := NewRadioGroup(options, selected)
+	d.body = append(d.body, rg)
+	d.rebuildRing()
+	return rg
 }
 
 // AddList adds a black-on-white scrollable list box to the body and returns it.
@@ -203,20 +228,16 @@ func (d *Dialog) AddTextLine(text string) *tview.TextView {
 	return tv
 }
 
-// AddButton adds a command button to the vertical button column and returns it.
-// The first button added becomes the default unless SetDefault overrides it.
-func (d *Dialog) AddButton(label string, action func()) *tview.Button {
-	b := tview.NewButton(label)
-	b.SetStyle(theme.ButtonFace())
-	// Focused/default button: reverse video (white-on-black), matching the
-	// VB-for-DOS default-button treatment.
-	b.SetActivatedStyle(tcell.StyleDefault.Foreground(theme.White).Background(theme.Black))
-	if action != nil {
-		b.SetSelectedFunc(action)
-	}
+// AddButton adds a 3-D raised command button (black-on-light-gray face, black
+// L-shaped drop shadow on the right + bottom edges) to the vertical button
+// column and returns it. The first button added becomes the default (drawn with
+// the black outline) unless SetDefault overrides it.
+func (d *Dialog) AddButton(label string, action func()) *Button {
+	b := NewButton(label, action)
 	d.buttons = append(d.buttons, b)
 	if d.def == nil {
 		d.def = b
+		b.SetDefaultButton(true)
 	}
 	d.rebuildRing()
 	return b
@@ -260,10 +281,12 @@ func (d *Dialog) layout() {
 		return
 	}
 
-	// Right-hand button column width = widest button label + 4 (padding), if any.
+	// Right-hand button column width = widest face + 1 shadow column. The face is
+	// the label padded one space each side, plus 2 outline columns for the
+	// default/focused outline => len(label) + 4; +1 for the right-edge shadow.
 	btnW := 0
 	for _, b := range d.buttons {
-		if w := len([]rune(b.GetLabel())) + 4; w > btnW {
+		if w := len([]rune(b.GetLabel())) + 4 + 1; w > btnW {
 			btnW = w
 		}
 	}
@@ -284,14 +307,15 @@ func (d *Dialog) layout() {
 	}
 
 	// Stack body controls vertically. Lists are greedy (share the remaining
-	// height); single-line controls take one row.
+	// height); single-line controls take one row; a RadioGroup takes one row per
+	// option.
 	var lists []tview.Primitive
 	fixedRows := 0
 	for _, p := range d.body {
 		if _, ok := p.(*tview.List); ok {
 			lists = append(lists, p)
 		} else {
-			fixedRows++
+			fixedRows += dlgBodyRows(p)
 		}
 	}
 	avail := ih - fixedRows
@@ -313,28 +337,52 @@ func (d *Dialog) layout() {
 			p.SetRect(bodyX, bottom-1, bodyW, 0)
 			continue
 		}
-		h := 1
+		h := dlgBodyRows(p)
 		if _, ok := p.(*tview.List); ok {
 			h = listH
-			if row+h > bottom {
-				h = bottom - row
-			}
+		}
+		if row+h > bottom {
+			h = bottom - row
 		}
 		p.SetRect(bodyX, row, bodyW, h)
 		row += h
 	}
 
-	// Buttons: vertical column on the right, top-aligned.
+	// Buttons: vertical column on the right, top-aligned. Each button is 3 rows
+	// tall (a 2-row light-gray face + a 1-row drop shadow) with one blank row
+	// between successive buttons, matching the stacked OK/Cancel/Help column in
+	// the VBDOS "Open" screenshot. On short dialogs the per-button height shrinks
+	// so the whole column still fits.
 	if btnW > 0 {
+		n := len(d.buttons)
+		btnH := 3 // 2 face rows + 1 shadow row
+		step := btnH + 1
+		// Shrink the step (then the height) so n buttons fit in ih rows.
+		for n > 0 && (n-1)*step+btnH > ih {
+			if step > btnH {
+				step--
+				continue
+			}
+			if btnH > 2 {
+				btnH--
+				step = btnH
+				continue
+			}
+			break
+		}
 		bx := ix + iw - btnW
 		by := iy
 		for _, b := range d.buttons {
-			if by >= bottom {
-				b.SetRect(bx, bottom-1, btnW, 0)
+			h := btnH
+			if by+h > bottom {
+				h = bottom - by
+			}
+			if by >= bottom || h < 2 {
+				b.SetRect(bx, dlgMaxInt(bottom-1, iy), btnW, 0)
 				continue
 			}
-			b.SetRect(bx, by, btnW, 1)
-			by += 2 // one blank row between buttons
+			b.SetRect(bx, by, btnW, h)
+			by += step
 		}
 	}
 }
@@ -418,6 +466,100 @@ func (d *Dialog) Draw(screen tcell.Screen) {
 			b.Draw(screen)
 		}
 	}
+
+	// DOS decorations drawn over the controls: a recessed frame + yellow caret on
+	// input fields, and a vertical scrollbar on list boxes.
+	for _, p := range d.body {
+		switch c := p.(type) {
+		case *tview.InputField:
+			d.decorateField(screen, c)
+		case *tview.List:
+			d.decorateList(screen, c)
+		}
+	}
+}
+
+// decorateField draws the recessed single-line frame around an input field's
+// text region and a Yellow caret cell (spec §4.3). The field's white-on-black
+// text region begins just after its label.
+func (d *Dialog) decorateField(screen tcell.Screen, in *tview.InputField) {
+	x, y, w, h := in.GetRect()
+	if w <= 0 || h <= 0 {
+		return
+	}
+	labelW := len([]rune(in.GetLabel()))
+	fieldX := x + labelW
+	fieldW := in.GetFieldWidth()
+	if fieldW <= 0 || fieldX+fieldW > x+w {
+		fieldW = x + w - fieldX
+	}
+	if fieldW <= 0 {
+		return
+	}
+	// Recessed look: bracket the white-on-black field region with single-line
+	// edge glyphs in dark gray on the body, evoking the inset VBDOS field frame.
+	frame := tcell.StyleDefault.Foreground(theme.DGray).Background(theme.LGray)
+	if fieldX-1 >= x {
+		screen.SetContent(fieldX-1, y, theme.VSingle, nil, frame)
+	}
+	if fieldX+fieldW <= x+w-1 {
+		screen.SetContent(fieldX+fieldW, y, theme.VSingle, nil, frame)
+	}
+	// Yellow caret cell (spec §4.3) at the end of the visible text within the
+	// field region, drawn only while the field is focused.
+	if in.HasFocus() {
+		caret := len([]rune(in.GetText()))
+		if caret >= fieldW {
+			caret = fieldW - 1
+		}
+		if caret >= 0 {
+			yellow := tcell.StyleDefault.Foreground(theme.Black).Background(theme.Yellow)
+			screen.SetContent(fieldX+caret, y, ' ', nil, yellow)
+		}
+	}
+}
+
+// decorateList draws a DOS-style vertical scrollbar on the right edge of a list
+// box: a shaded track with up/down arrows at the ends and a solid thumb whose
+// position reflects the current selection.
+func (d *Dialog) decorateList(screen tcell.Screen, list *tview.List) {
+	x, y, w, h := list.GetRect()
+	if w < 2 || h < 1 {
+		return
+	}
+	sx := x + w - 1
+	track := tcell.StyleDefault.Foreground(theme.DGray).Background(theme.White)
+	thumb := tcell.StyleDefault.Foreground(theme.Black).Background(theme.White)
+	arrow := tcell.StyleDefault.Foreground(theme.Black).Background(theme.White)
+
+	count := list.GetItemCount()
+	cur := list.GetCurrentItem()
+
+	// Track fills the column.
+	for r := y; r < y+h; r++ {
+		screen.SetContent(sx, r, theme.SbTrack, nil, track)
+	}
+	if h >= 1 {
+		screen.SetContent(sx, y, theme.SbUp, nil, arrow)
+	}
+	if h >= 2 {
+		screen.SetContent(sx, y+h-1, theme.SbDown, nil, arrow)
+	}
+	// Thumb sits in the inner track (between the arrows).
+	inner := h - 2
+	if inner >= 1 && count > 0 {
+		pos := 0
+		if count > 1 {
+			pos = cur * (inner - 1) / (count - 1)
+		}
+		if pos < 0 {
+			pos = 0
+		}
+		if pos > inner-1 {
+			pos = inner - 1
+		}
+		screen.SetContent(sx, y+1+pos, theme.SbThumb, nil, thumb)
+	}
 }
 
 // ----------------------------------------------------------------------------
@@ -478,22 +620,20 @@ func (d *Dialog) keepFocus(setFocus func(p tview.Primitive)) func(p tview.Primit
 }
 
 // currentIsButton reports whether the focused ring entry is a command button.
-func (d *Dialog) currentIsButton() (*tview.Button, bool) {
+func (d *Dialog) currentIsButton() (*Button, bool) {
 	if d.index < 0 || d.index >= len(d.ring) {
 		return nil, false
 	}
-	b, ok := d.ring[d.index].(*tview.Button)
+	b, ok := d.ring[d.index].(*Button)
 	return b, ok
 }
 
-// fire activates a button's selected handler.
-func dlgFire(b *tview.Button) {
-	if b == nil || b.IsDisabled() {
+// dlgFire activates a button's action.
+func dlgFire(b *Button) {
+	if b == nil {
 		return
 	}
-	if h := b.InputHandler(); h != nil {
-		h(tcell.NewEventKey(tcell.KeyEnter, '\r', tcell.ModNone), func(tview.Primitive) {})
-	}
+	b.Fire()
 }
 
 // InputHandler implements the uniform key semantics: Tab/Shift+Tab cycle the
