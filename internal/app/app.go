@@ -38,14 +38,11 @@ type App struct {
 	moveSize         bool // keyboard move/size mode active (Ctrl+F5)
 
 	// lineNumbers is the app-wide preference for showing line numbers in editor
-	// windows. New windows inherit it; toggleLineNumbers applies it to all open
+	// windows. New windows inherit it; setLineNumbers applies it to all open
 	// editors. Default false. Settable before windows are created via
-	// SetLineNumbersDefault, and reflected in the Window menu's toggle item.
+	// SetLineNumbersDefault, and changeable at runtime via the Edit > Options
+	// dialog.
 	lineNumbers bool
-
-	// lineNumbersItem points at the Window-menu "Line Numbers" toggle so its
-	// label can reflect the current on/off state when toggled.
-	lineNumbersItem *ui.MenuItem
 
 	// placed records windows already sized against real desktop geometry, so a
 	// window created before the first layout (when the manager's inner rect is
@@ -135,31 +132,16 @@ func (a *App) OpenInitialWindow() {
 // windows are created (e.g. from the CLI flag) so the initial window honours it.
 func (a *App) SetLineNumbersDefault(on bool) {
 	a.lineNumbers = on
-	if a.lineNumbersItem != nil {
-		a.lineNumbersItem.Label = lineNumbersLabel(on)
-	}
 }
 
-// toggleLineNumbers flips the line-numbers preference and applies it to every
-// open editor, then forces a redraw so the change shows immediately. The Window
-// menu toggle item's label is updated to reflect the new state.
-func (a *App) toggleLineNumbers() {
-	a.lineNumbers = !a.lineNumbers
+// setLineNumbers sets the line-numbers preference and applies it to every open
+// editor, then forces a redraw so the change shows immediately.
+func (a *App) setLineNumbers(on bool) {
+	a.lineNumbers = on
 	for _, w := range a.windows {
-		w.Editor().SetLineNumbers(a.lineNumbers)
-	}
-	if a.lineNumbersItem != nil {
-		a.lineNumbersItem.Label = lineNumbersLabel(a.lineNumbers)
+		w.Editor().SetLineNumbers(on)
 	}
 	a.tapp.Draw()
-}
-
-// lineNumbersLabel renders the Window-menu toggle label with its checkbox state.
-func lineNumbersLabel(on bool) string {
-	if on {
-		return "Line Numbers  [X]"
-	}
-	return "Line Numbers  [ ]"
 }
 
 // --- window lifecycle ------------------------------------------------------

@@ -877,6 +877,45 @@ func NewGotoLineDialog(onOK func(line int), onCancel func()) (tview.Primitive, i
 	return frame, 40, 8
 }
 
+// Options holds the user-configurable editor preferences shown in the Options
+// dialog. It is a plain value type so additional fields can be added later
+// without changing the dialog's call signature.
+type Options struct {
+	LineNumbers bool
+}
+
+// NewOptionsDialog builds the modal Options/Preferences dialog: a "Line
+// Numbers" checkbox (seeded from cur) with OK / Cancel buttons. OK reads the
+// checkbox's current state and calls onOK with the resulting Options; onCancel
+// fires on Cancel/Esc.
+func NewOptionsDialog(cur Options, onOK func(Options), onCancel func()) (tview.Primitive, int, int) {
+	form := tview.NewForm()
+	dlgStyleForm(form)
+	form.AddCheckbox("Line Numbers", cur.LineNumbers, nil)
+	form.AddButton("OK", func() {
+		if onOK != nil {
+			onOK(Options{LineNumbers: dlgCheckboxState(form, "Line Numbers")})
+		}
+	})
+	form.AddButton("Cancel", func() {
+		if onCancel != nil {
+			onCancel()
+		}
+	})
+	form.SetCancelFunc(func() {
+		if onCancel != nil {
+			onCancel()
+		}
+	})
+
+	body := tview.NewFlex().SetDirection(tview.FlexRow)
+	body.SetBackgroundColor(theme.LGray)
+	body.AddItem(form, 0, 1, true)
+
+	frame := dlgNewFrame("Options", body)
+	return frame, 40, 9
+}
+
 // NewAboutDialog builds the modal About box with product credits and a single
 // OK button. onOK fires on OK or Esc.
 func NewAboutDialog(onOK func()) (tview.Primitive, int, int) {

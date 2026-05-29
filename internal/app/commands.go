@@ -29,12 +29,7 @@ func (a *App) BuildMenus() []*ui.Menu {
 		{Separator: true},
 		{Label: "Move/Size", Mnemonic: 'M', Accel: "Ctrl+F5", Action: a.cmdMoveSize},
 		{Label: "Maximize/Restore", Mnemonic: 'x', Accel: "Ctrl+F10", Action: a.cmdToggleMax},
-		{Separator: true},
-		{Label: lineNumbersLabel(a.lineNumbers), Mnemonic: 'L', Action: a.toggleLineNumbers},
 	}}
-	// Keep a pointer to the live "Line Numbers" item so toggleLineNumbers can
-	// mutate its label to reflect the on/off state. It is the last item.
-	a.lineNumbersItem = &windowMenu.Items[len(windowMenu.Items)-1]
 
 	return []*ui.Menu{
 		{Title: "File", Mnemonic: 'F', Items: []ui.MenuItem{
@@ -59,6 +54,8 @@ func (a *App) BuildMenus() []*ui.Menu {
 			{Label: "Delete", Mnemonic: 'D', Accel: "Del", Action: func() { a.editKey(tcell.NewEventKey(tcell.KeyDelete, 0, tcell.ModNone)) }},
 			{Separator: true},
 			{Label: "Select All", Mnemonic: 'A', Action: a.cmdSelectAll},
+			{Separator: true},
+			{Label: "Options...", Mnemonic: 'O', Action: a.cmdOptions},
 		}},
 		{Title: "Search", Mnemonic: 'S', Items: []ui.MenuItem{
 			{Label: "Find...", Mnemonic: 'F', Accel: "Ctrl+F", Action: a.cmdFind},
@@ -311,6 +308,15 @@ func (a *App) cmdSelectAll() {
 	a.editKey(tcell.NewEventKey(tcell.KeyHome, 0, tcell.ModCtrl))
 	a.editKey(tcell.NewEventKey(tcell.KeyEnd, 0, tcell.ModCtrl|tcell.ModShift))
 	a.tapp.Draw()
+}
+
+// cmdOptions opens the Options dialog, applying changes (currently the
+// line-numbers preference) to all open editors on OK.
+func (a *App) cmdOptions() {
+	prim, w, h := ui.NewOptionsDialog(ui.Options{LineNumbers: a.lineNumbers},
+		func(opt ui.Options) { a.closeModal(); a.setLineNumbers(opt.LineNumbers) },
+		func() { a.closeModal() })
+	a.showModal(prim, w, h)
 }
 
 // --- Search commands -------------------------------------------------------
