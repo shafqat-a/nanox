@@ -90,7 +90,11 @@ func New(tapp *tview.Application, desktop *ui.Desktop, statusbar *ui.StatusBar) 
 	// winman window drag/resize and the editor keep working.
 	tapp.SetMouseCapture(func(ev *tcell.EventMouse, action tview.MouseAction) (*tcell.EventMouse, tview.MouseAction) {
 		if a.modalOpen {
-			return ev, action
+			// Belt-and-suspenders: while a modal is open, swallow every mouse
+			// event at the app level so the menu bar's hit-testing never runs.
+			// The full-screen modalLayer already blocks Pages routing to the
+			// background; swallowing here guarantees the bar gets nothing.
+			return nil, action
 		}
 		x, y := ev.Position()
 		if a.menubar.HandleMouse(action, x, y) {
@@ -350,21 +354,18 @@ func (a *App) tileWindows() {
 
 // showModal centres prim (sized w×h) over the main layout, blocks the windows
 // beneath it and gives it focus. The status bar switches to the dialog context.
+//
+// prim is wrapped in a full-screen modalLayer added as the modal page (with
+// resize=true so it always fills the screen). The layer centres prim in a w×h
+// sub-rect and consumes every mouse event outside it, so clicks on background
+// windows or the menu bar are dead — the dialog is truly modal. Focus is given
+// to prim itself so its internal Tab focus-group works.
 func (a *App) showModal(prim tview.Primitive, w, h int) {
 	a.modalOpen = true
 	a.statusbar.SetContext(ui.CtxDialog)
 
-	// Centre using a Flex sandwich (flexible spacers around a fixed cell).
-	row := tview.NewFlex().SetDirection(tview.FlexColumn).
-		AddItem(nil, 0, 1, false).
-		AddItem(prim, w, 0, true).
-		AddItem(nil, 0, 1, false)
-	center := tview.NewFlex().SetDirection(tview.FlexRow).
-		AddItem(nil, 0, 1, false).
-		AddItem(row, h, 0, true).
-		AddItem(nil, 0, 1, false)
-
-	a.pages.AddPage(modalPageName, center, true, true)
+	layer := newModalLayer(prim, w, h)
+	a.pages.AddPage(modalPageName, layer, true, true)
 	a.tapp.SetFocus(prim)
 }
 
