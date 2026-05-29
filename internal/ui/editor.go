@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"strconv"
 	"strings"
 	"unicode"
 
@@ -45,6 +46,16 @@ type Editor struct {
 	edLastWholeWord bool
 	edLastForward   bool
 	edHasSearch     bool
+
+	// line-number gutter toggle (off by default).
+	edLineNumbers bool
+
+	// scrollbar drag state. While dragging, MouseMove maps the pointer to a
+	// new scroll offset (without moving the cursor) and the editor captures
+	// follow-up events.
+	edVDragging bool // vertical thumb drag in progress
+	edHDragging bool // horizontal thumb drag in progress
+	edDragGrab  int  // offset of the grab point within the thumb (in track cells)
 }
 
 // NewEditor creates an Editor over buffer b (a fresh untitled buffer if nil).
@@ -79,6 +90,13 @@ func (e *Editor) SetOnCursorMove(fn func(ln, col int, ins bool)) {
 // SetOnChange registers a callback fired when the buffer's Modified state may
 // have changed.
 func (e *Editor) SetOnChange(fn func()) { e.onChange = fn }
+
+// SetLineNumbers toggles the left line-number gutter. It only changes display
+// state (no buffer mutation); the next Draw reflects the change.
+func (e *Editor) SetLineNumbers(on bool) { e.edLineNumbers = on }
+
+// LineNumbers reports whether the line-number gutter is currently shown.
+func (e *Editor) LineNumbers() bool { return e.edLineNumbers }
 
 // --- notifications ---
 
@@ -625,38 +643,78 @@ func (e *Editor) edPageDown() {
 	e.curCol = edMin(e.curCol, e.edLineLen(e.curLine))
 }
 
-// --- drawing ---
+// --- geometry (shared by Draw and mouse handling) ---
 
-// Draw renders the editor's inner text area and scrollbars.
-func (e *Editor) Draw(screen tcell.Screen) {
-	e.DrawForSubclass(screen, e.Box)
-	x, y, w, h := e.GetInnerRect()
-	if w <= 0 || h <= 0 {
-		return
+// edDigits returns the number of decimal digits in n (n >= 1).
+func edDigits(n int) int {
+	d := 1
+	for n >= 10 {
+		n /= 10
+		d++
 	}
+	return d
+}
 
-	lineCount := e.buf.LineCount()
-	maxWidth := 0
+// edGutterWidth returns the width (in cells) of the line-number gutter, or 0
+// when the gutter is disabled. The gutter is wide enough for the largest
+// line number plus one padding space, with a minimum of 4.
+func (e *Editor) edGutterWidth() int {
+	if !e.edLineNumbers {
+		return 0
+	}
+	w := edDigits(e.buf.LineCount()) + 1
+	if w < 4 {
+		w = 4
+	}
+	return w
+}
+
+// edGutterStyle is the style used to paint the line-number gutter: light cyan
+// on the editor's blue background, distinct from the white code text.
+func edGutterStyle() tcell.Style {
+	return tcell.StyleDefault.Foreground(theme.LCyan).Background(theme.Blue)
+}
+
+// edGeometry computes the layout the editor uses for both rendering and mouse
+// mapping. It mirrors Draw exactly: it reserves a left gutter (when line
+// numbers are on) and the vertical/horizontal scrollbars as needed.
+//
+//	gw      gutter width (0 when off)
+//	textX   first screen column of the text area (innerX + gw)
+//	textY   first screen row of the text area (== innerY)
+//	textW   width of the text area in cells (>=1)
+//	textH   height of the text area in cells (>=1)
+//	needV   vertical scrollbar shown
+//	needH   horizontal scrollbar shown
+func (e *Editor) edGeometry() (gw, textX, textY, textW, textH int, needV, needH bool, lineCount, maxWidth int) {
+	innerX, innerY, w, h := e.GetInnerRect()
+	gw = e.edGutterWidth()
+
+	lineCount = e.buf.LineCount()
+	maxWidth = 0
 	for i := 0; i < lineCount; i++ {
 		if dw := e.edLineDisplayWidth(i); dw > maxWidth {
 			maxWidth = dw
 		}
 	}
 
-	// Decide whether scrollbars are needed. Account for the space they take.
-	textW, textH := w, h
-	needV := lineCount > textH
-	needH := maxWidth > textW
+	// The gutter eats into the available width before scrollbar reservation.
+	availW := w - gw
+	if availW < 1 {
+		availW = 1
+	}
+	textW, textH = availW, h
+	needV = lineCount > textH
+	needH = maxWidth > textW
 	if needV {
-		textW = w - 1
+		textW = availW - 1
 	}
 	if needH {
 		textH = h - 1
 	}
-	// Re-evaluate after reserving (a bar may become needed once the other shrinks).
 	if !needV && lineCount > textH {
 		needV = true
-		textW = w - 1
+		textW = availW - 1
 	}
 	if !needH && maxWidth > textW {
 		needH = true
@@ -668,12 +726,88 @@ func (e *Editor) Draw(screen tcell.Screen) {
 	if textH < 1 {
 		textH = 1
 	}
+	textX = innerX + gw
+	textY = innerY
+	return
+}
+
+// edVScrollGeom returns the vertical scrollbar geometry, mirroring
+// edDrawVScroll. shown reports whether the bar is present. col is its screen
+// column; upY/downY are the arrow cell rows; trackTop/trackLen describe the
+// inner track between the arrows; thumbPos/thumbLen describe the thumb within
+// that track (thumbLen is always 1 here, matching the existing single-cell
+// thumb). maxTop is the maximum topLine value.
+func (e *Editor) edVScrollGeom() (shown bool, col, upY, downY, trackTop, trackLen, thumbPos, thumbLen, maxTop int) {
+	gw, textX, textY, textW, textH, needV, _, lineCount, _ := e.edGeometry()
+	if !needV {
+		return false, 0, 0, 0, 0, 0, 0, 0, 0
+	}
+	_ = gw
+	col = textX + textW
+	upY = textY
+	downY = textY + textH - 1
+	trackTop = textY + 1
+	trackLen = textH - 2
+	maxTop = edMax(0, lineCount-textH)
+	thumbLen = 1
+	thumbPos = 0
+	if trackLen > 0 {
+		mt := edMax(1, lineCount-textH)
+		if mt > 0 {
+			thumbPos = e.topLine * (trackLen - 1) / mt
+		}
+		thumbPos = edClamp(thumbPos, 0, trackLen-1)
+	}
+	return true, col, upY, downY, trackTop, trackLen, thumbPos, thumbLen, maxTop
+}
+
+// edHScrollGeom returns the horizontal scrollbar geometry, mirroring
+// edDrawHScroll. shown reports whether the bar is present. row is its screen
+// row; leftX/rightX are the arrow cell columns; trackLeft/trackLen describe the
+// inner track; thumbPos/thumbLen describe the thumb; maxLeft is the maximum
+// leftCol value.
+func (e *Editor) edHScrollGeom() (shown bool, row, leftX, rightX, trackLeft, trackLen, thumbPos, thumbLen, maxLeft int) {
+	_, textX, textY, textW, textH, _, needH, _, maxWidth := e.edGeometry()
+	if !needH {
+		return false, 0, 0, 0, 0, 0, 0, 0, 0
+	}
+	row = textY + textH
+	leftX = textX
+	rightX = textX + textW - 1
+	trackLeft = textX + 1
+	trackLen = textW - 2
+	maxLeft = edMax(0, maxWidth-textW)
+	thumbLen = 1
+	thumbPos = 0
+	if trackLen > 0 {
+		ml := edMax(1, maxWidth-textW)
+		if ml > 0 {
+			thumbPos = e.leftCol * (trackLen - 1) / ml
+		}
+		thumbPos = edClamp(thumbPos, 0, trackLen-1)
+	}
+	return true, row, leftX, rightX, trackLeft, trackLen, thumbPos, thumbLen, maxLeft
+}
+
+// --- drawing ---
+
+// Draw renders the editor's inner text area and scrollbars.
+func (e *Editor) Draw(screen tcell.Screen) {
+	e.DrawForSubclass(screen, e.Box)
+	_, _, w, h := e.GetInnerRect()
+	if w <= 0 || h <= 0 {
+		return
+	}
+
+	gw, textX, textY, textW, textH, needV, needH, lineCount, maxWidth := e.edGeometry()
+	innerX := textX - gw // original inner left edge
 
 	e.edScrollToCursorWith(textW, textH)
 
 	base := theme.EditorText()
 	sel := theme.Selection()
 	cursorStyle := theme.Cursor()
+	gutterStyle := edGutterStyle()
 
 	var sl, sc, el, ec int
 	hasSel := e.edHasSelection()
@@ -683,24 +817,46 @@ func (e *Editor) Draw(screen tcell.Screen) {
 
 	for row := 0; row < textH; row++ {
 		lineIdx := e.topLine + row
-		sy := y + row
-		// Blank the row first.
+		sy := textY + row
+		// Paint the gutter (right-aligned 1-based number, or blank).
+		if gw > 0 {
+			label := []rune(strings.Repeat(" ", gw))
+			if lineIdx < lineCount {
+				num := []rune(edRightAlign(lineIdx+1, gw-1))
+				copy(label, num)
+			}
+			for col := 0; col < gw; col++ {
+				screen.SetContent(innerX+col, sy, label[col], nil, gutterStyle)
+			}
+		}
+		// Blank the text row first.
 		for col := 0; col < textW; col++ {
-			screen.SetContent(x+col, sy, ' ', nil, base)
+			screen.SetContent(textX+col, sy, ' ', nil, base)
 		}
 		if lineIdx >= lineCount {
 			continue
 		}
-		e.edDrawLine(screen, x, sy, textW, lineIdx, base, sel, cursorStyle,
+		e.edDrawLine(screen, textX, sy, textW, lineIdx, base, sel, cursorStyle,
 			hasSel, sl, sc, el, ec)
 	}
 
 	if needV {
-		e.edDrawVScroll(screen, x+textW, y, textH, lineCount)
+		e.edDrawVScroll(screen, textX+textW, textY, textH, lineCount)
 	}
 	if needH {
-		e.edDrawHScroll(screen, x, y+textH, textW, maxWidth)
+		e.edDrawHScroll(screen, textX, textY+textH, textW, maxWidth)
 	}
+}
+
+// edRightAlign formats n right-aligned in a field of the given width, padded
+// with leading spaces. The result is exactly width runes (truncation is not
+// expected since width is derived from the digit count).
+func edRightAlign(n, width int) string {
+	s := strconv.Itoa(n)
+	if len(s) < width {
+		s = strings.Repeat(" ", width-len(s)) + s
+	}
+	return s
 }
 
 // edScrollToCursorWith keeps the cursor visible given the text area dimensions.
@@ -1258,10 +1414,11 @@ func (e *Editor) edVisualToCol(line, visCol int) int {
 // and visual col = leftCol + (x-innerX). Clicking past the last line lands on
 // the last line; past end-of-line lands on the line end.
 func (e *Editor) edMousePos(x, y int) (line, col int) {
-	innerX, innerY, _, _ := e.GetInnerRect()
-	line = e.topLine + (y - innerY)
+	gw, textX, textY, _, _, _, _, _, _ := e.edGeometry()
+	_ = gw
+	line = e.topLine + (y - textY)
 	line = edClamp(line, 0, e.buf.LineCount()-1)
-	visCol := e.leftCol + (x - innerX)
+	visCol := e.leftCol + (x - textX)
 	col = e.edVisualToCol(line, visCol)
 	col = edClamp(col, 0, e.edLineLen(line))
 	return line, col
@@ -1275,36 +1432,7 @@ func (e *Editor) edScrollToCursor() {
 	if w <= 0 || h <= 0 {
 		return
 	}
-	lineCount := e.buf.LineCount()
-	maxWidth := 0
-	for i := 0; i < lineCount; i++ {
-		if dw := e.edLineDisplayWidth(i); dw > maxWidth {
-			maxWidth = dw
-		}
-	}
-	textW, textH := w, h
-	needV := lineCount > textH
-	needH := maxWidth > textW
-	if needV {
-		textW = w - 1
-	}
-	if needH {
-		textH = h - 1
-	}
-	if !needV && lineCount > textH {
-		needV = true
-		textW = w - 1
-	}
-	if !needH && maxWidth > textW {
-		needH = true
-		textH = h - 1
-	}
-	if textW < 1 {
-		textW = 1
-	}
-	if textH < 1 {
-		textH = 1
-	}
+	_, _, _, textW, textH, _, _, _, _ := e.edGeometry()
 	e.edScrollToCursorWith(textW, textH)
 }
 
@@ -1322,6 +1450,15 @@ func (e *Editor) MouseHandler() func(action tview.MouseAction, event *tcell.Even
 			if !e.InRect(x, y) {
 				return false, nil
 			}
+			// Scrollbar hit-tests take priority over text positioning.
+			if c, ok := e.edVScrollClick(x, y); ok {
+				setFocus(e)
+				return true, c
+			}
+			if c, ok := e.edHScrollClick(x, y); ok {
+				setFocus(e)
+				return true, c
+			}
 			setFocus(e)
 			line, col := e.edMousePos(x, y)
 			e.curLine, e.curCol = line, col
@@ -1335,7 +1472,18 @@ func (e *Editor) MouseHandler() func(action tview.MouseAction, event *tcell.Even
 			return true, e
 
 		case tview.MouseMove:
-			// Only act on motion while the left button is held (a drag).
+			// A scrollbar drag in progress maps the pointer to a scroll offset
+			// without moving the cursor.
+			if e.edVDragging {
+				e.edVDragTo(y)
+				return true, e
+			}
+			if e.edHDragging {
+				e.edHDragTo(x)
+				return true, e
+			}
+			// Otherwise act on motion only while the left button is held (a
+			// text drag-select).
 			if event.Buttons()&tcell.ButtonPrimary == 0 || e.selAnchor == nil {
 				return false, nil
 			}
@@ -1347,6 +1495,11 @@ func (e *Editor) MouseHandler() func(action tview.MouseAction, event *tcell.Even
 			return true, e
 
 		case tview.MouseLeftUp:
+			if e.edVDragging || e.edHDragging {
+				e.edVDragging = false
+				e.edHDragging = false
+				return true, nil
+			}
 			// End of a drag: drop the anchor if nothing was actually selected.
 			if e.selAnchor != nil && !e.edHasSelection() {
 				e.edClearSelection()
@@ -1366,6 +1519,114 @@ func (e *Editor) MouseHandler() func(action tview.MouseAction, event *tcell.Even
 
 		return false, nil
 	})
+}
+
+// edVScrollClick handles a left-button-down on the vertical scrollbar column.
+// It returns the capture primitive (the editor while dragging) and whether the
+// click landed on the bar (and was thus handled).
+func (e *Editor) edVScrollClick(x, y int) (tview.Primitive, bool) {
+	shown, col, upY, downY, trackTop, trackLen, thumbPos, thumbLen, _ := e.edVScrollGeom()
+	if !shown || x != col {
+		return nil, false
+	}
+	switch {
+	case y == upY:
+		e.topLine = edMax(0, e.topLine-1)
+	case y == downY:
+		e.topLine = edMin(e.edMaxTopLine(), e.topLine+1)
+	case y < trackTop || y >= trackTop+trackLen:
+		// Outside the track (shouldn't happen given the column matched), ignore.
+	case y < trackTop+thumbPos:
+		e.topLine = edMax(0, e.topLine-e.edPageRows())
+	case y >= trackTop+thumbPos+thumbLen:
+		e.topLine = edMin(e.edMaxTopLine(), e.topLine+e.edPageRows())
+	default:
+		// On the thumb: begin a drag, remembering the grab offset.
+		e.edVDragging = true
+		e.edDragGrab = y - (trackTop + thumbPos)
+		return e, true
+	}
+	return nil, true
+}
+
+// edHScrollClick mirrors edVScrollClick for the horizontal scrollbar row.
+func (e *Editor) edHScrollClick(x, y int) (tview.Primitive, bool) {
+	shown, row, leftX, rightX, trackLeft, trackLen, thumbPos, thumbLen, _ := e.edHScrollGeom()
+	if !shown || y != row {
+		return nil, false
+	}
+	page := e.edPageCols()
+	switch {
+	case x == leftX:
+		e.leftCol = edMax(0, e.leftCol-1)
+	case x == rightX:
+		e.leftCol = edMin(e.edMaxLeftCol(), e.leftCol+1)
+	case x < trackLeft || x >= trackLeft+trackLen:
+		// Outside the track, ignore.
+	case x < trackLeft+thumbPos:
+		e.leftCol = edMax(0, e.leftCol-page)
+	case x >= trackLeft+thumbPos+thumbLen:
+		e.leftCol = edMin(e.edMaxLeftCol(), e.leftCol+page)
+	default:
+		e.edHDragging = true
+		e.edDragGrab = x - (trackLeft + thumbPos)
+		return e, true
+	}
+	return nil, true
+}
+
+// edVDragTo maps mouse y within the vertical track to a new topLine.
+func (e *Editor) edVDragTo(y int) {
+	shown, _, _, _, trackTop, trackLen, _, thumbLen, maxTop := e.edVScrollGeom()
+	if !shown {
+		return
+	}
+	span := trackLen - thumbLen
+	if span <= 0 || maxTop <= 0 {
+		e.topLine = edClamp(e.topLine, 0, maxTop)
+		return
+	}
+	rel := y - trackTop - e.edDragGrab
+	top := (rel*maxTop + span/2) / span // round to nearest
+	e.topLine = edClamp(top, 0, maxTop)
+}
+
+// edHDragTo maps mouse x within the horizontal track to a new leftCol.
+func (e *Editor) edHDragTo(x int) {
+	shown, _, _, _, trackLeft, trackLen, _, thumbLen, maxLeft := e.edHScrollGeom()
+	if !shown {
+		return
+	}
+	span := trackLen - thumbLen
+	if span <= 0 || maxLeft <= 0 {
+		e.leftCol = edClamp(e.leftCol, 0, maxLeft)
+		return
+	}
+	rel := x - trackLeft - e.edDragGrab
+	left := (rel*maxLeft + span/2) / span
+	e.leftCol = edClamp(left, 0, maxLeft)
+}
+
+// edMaxTopLine returns the largest valid topLine (totalLines - visibleRows).
+func (e *Editor) edMaxTopLine() int {
+	_, _, _, _, textH, _, _, lineCount, _ := e.edGeometry()
+	return edMax(0, lineCount-textH)
+}
+
+// edMaxLeftCol returns the largest valid leftCol (maxWidth - visibleCols).
+func (e *Editor) edMaxLeftCol() int {
+	_, _, _, textW, _, _, _, _, maxWidth := e.edGeometry()
+	return edMax(0, maxWidth-textW)
+}
+
+// edPageCols returns the number of text columns in the view (>=1) for paging
+// the horizontal scrollbar.
+func (e *Editor) edPageCols() int {
+	_, _, _, textW, _, _, _, _, _ := e.edGeometry()
+	if textW < 1 {
+		return 1
+	}
+	return textW
 }
 
 // GotoLine moves the cursor to the start of 1-based line n, clamped to the

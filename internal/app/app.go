@@ -37,6 +37,16 @@ type App struct {
 	modalOpen        bool
 	moveSize         bool // keyboard move/size mode active (Ctrl+F5)
 
+	// lineNumbers is the app-wide preference for showing line numbers in editor
+	// windows. New windows inherit it; toggleLineNumbers applies it to all open
+	// editors. Default false. Settable before windows are created via
+	// SetLineNumbersDefault, and reflected in the Window menu's toggle item.
+	lineNumbers bool
+
+	// lineNumbersItem points at the Window-menu "Line Numbers" toggle so its
+	// label can reflect the current on/off state when toggled.
+	lineNumbersItem *ui.MenuItem
+
 	// placed records windows already sized against real desktop geometry, so a
 	// window created before the first layout (when the manager's inner rect is
 	// still a tview default) is re-sized once on first activation.
@@ -121,12 +131,44 @@ func (a *App) OpenInitialWindow() {
 	a.newEditorWindow(buffer.NewUntitled())
 }
 
+// SetLineNumbersDefault sets the app-wide line-numbers preference. Call before
+// windows are created (e.g. from the CLI flag) so the initial window honours it.
+func (a *App) SetLineNumbersDefault(on bool) {
+	a.lineNumbers = on
+	if a.lineNumbersItem != nil {
+		a.lineNumbersItem.Label = lineNumbersLabel(on)
+	}
+}
+
+// toggleLineNumbers flips the line-numbers preference and applies it to every
+// open editor, then forces a redraw so the change shows immediately. The Window
+// menu toggle item's label is updated to reflect the new state.
+func (a *App) toggleLineNumbers() {
+	a.lineNumbers = !a.lineNumbers
+	for _, w := range a.windows {
+		w.Editor().SetLineNumbers(a.lineNumbers)
+	}
+	if a.lineNumbersItem != nil {
+		a.lineNumbersItem.Label = lineNumbersLabel(a.lineNumbers)
+	}
+	a.tapp.Draw()
+}
+
+// lineNumbersLabel renders the Window-menu toggle label with its checkbox state.
+func lineNumbersLabel(on bool) string {
+	if on {
+		return "Line Numbers  [X]"
+	}
+	return "Line Numbers  [ ]"
+}
+
 // --- window lifecycle ------------------------------------------------------
 
 // newEditorWindow builds an editor window over buf, wires its callbacks and
 // adds it to the desktop. The new window becomes the active window.
 func (a *App) newEditorWindow(buf *buffer.Buffer) *ui.EditorWindow {
 	ed := ui.NewEditor(buf)
+	ed.SetLineNumbers(a.lineNumbers)
 	number := a.nextWindowNumber
 	a.nextWindowNumber++
 

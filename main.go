@@ -6,6 +6,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"os"
 
@@ -26,6 +27,9 @@ func main() {
 // terminal is always restored (tview.Application.Run does this on return) and
 // any error can be reported with a non-zero exit code.
 func run() error {
+	lineNumbersFlag := flag.Bool("line-numbers", false, "show line numbers in editor windows")
+	flag.Parse()
+
 	tapp := tview.NewApplication()
 	tapp.EnableMouse(true)
 
@@ -36,6 +40,7 @@ func run() error {
 	// bar. Construct the App first (it builds the bar from its own command
 	// tree and installs it into the root layout), then open the first window.
 	a := app.New(tapp, desktop, statusbar)
+	a.SetLineNumbersDefault(*lineNumbersFlag)
 	a.OpenInitialWindow()
 
 	tapp.SetInputCapture(a.RouteGlobalKeys)

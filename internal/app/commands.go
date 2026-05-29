@@ -20,6 +20,22 @@ import (
 // passes it to New; we re-attach the same menus here so the bar's actions and
 // the App agree.
 func (a *App) BuildMenus() []*ui.Menu {
+	windowMenu := &ui.Menu{Title: "Window", Mnemonic: 'W', Items: []ui.MenuItem{
+		{Label: "Next", Mnemonic: 'N', Accel: "F6", Action: func() { a.cycleWindow(1) }},
+		{Label: "Previous", Mnemonic: 'P', Accel: "Shift+F6", Action: func() { a.cycleWindow(-1) }},
+		{Separator: true},
+		{Label: "Cascade", Mnemonic: 'C', Action: a.cascadeWindows},
+		{Label: "Tile", Mnemonic: 'T', Accel: "F5", Action: a.tileWindows},
+		{Separator: true},
+		{Label: "Move/Size", Mnemonic: 'M', Accel: "Ctrl+F5", Action: a.cmdMoveSize},
+		{Label: "Maximize/Restore", Mnemonic: 'x', Accel: "Ctrl+F10", Action: a.cmdToggleMax},
+		{Separator: true},
+		{Label: lineNumbersLabel(a.lineNumbers), Mnemonic: 'L', Action: a.toggleLineNumbers},
+	}}
+	// Keep a pointer to the live "Line Numbers" item so toggleLineNumbers can
+	// mutate its label to reflect the on/off state. It is the last item.
+	a.lineNumbersItem = &windowMenu.Items[len(windowMenu.Items)-1]
+
 	return []*ui.Menu{
 		{Title: "File", Mnemonic: 'F', Items: []ui.MenuItem{
 			{Label: "New", Mnemonic: 'N', Action: a.cmdNew},
@@ -51,16 +67,7 @@ func (a *App) BuildMenus() []*ui.Menu {
 			{Separator: true},
 			{Label: "Go to Line...", Mnemonic: 'G', Accel: "Ctrl+G", Action: a.cmdGotoLine},
 		}},
-		{Title: "Window", Mnemonic: 'W', Items: []ui.MenuItem{
-			{Label: "Next", Mnemonic: 'N', Accel: "F6", Action: func() { a.cycleWindow(1) }},
-			{Label: "Previous", Mnemonic: 'P', Accel: "Shift+F6", Action: func() { a.cycleWindow(-1) }},
-			{Separator: true},
-			{Label: "Cascade", Mnemonic: 'C', Action: a.cascadeWindows},
-			{Label: "Tile", Mnemonic: 'T', Accel: "F5", Action: a.tileWindows},
-			{Separator: true},
-			{Label: "Move/Size", Mnemonic: 'M', Accel: "Ctrl+F5", Action: a.cmdMoveSize},
-			{Label: "Maximize/Restore", Mnemonic: 'x', Accel: "Ctrl+F10", Action: a.cmdToggleMax},
-		}},
+		windowMenu,
 		{Title: "Help", Mnemonic: 'H', Items: []ui.MenuItem{
 			{Label: "Keys", Mnemonic: 'K', Action: a.cmdKeys},
 			{Separator: true},
