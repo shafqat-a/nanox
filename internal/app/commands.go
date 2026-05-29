@@ -107,7 +107,7 @@ func (a *App) startDir() string {
 func (a *App) cmdNew() { a.newEditorWindow(buffer.NewUntitled()) }
 
 func (a *App) cmdOpen() {
-	prim, w, h := ui.NewOpenDialog(a.startDir(), "*.BAS",
+	prim, w, h := ui.NewOpenDialog(a.startDir(), "*.*",
 		func(path string) {
 			a.closeModal()
 			buf, err := buffer.Load(path)

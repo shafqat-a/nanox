@@ -1,9 +1,13 @@
 // This file implements DOSEdit's modal dialogs (spec §6.6): Open, Save As,
 // MessageBox, Find, Replace, Go To Line and About.
 //
-// Every dialog is built from a tview.Form (inputs + checkboxes + stacked
-// command buttons down the right) and, for file dialogs, two tview.List
-// boxes (directories and files). Each constructor returns a ready-to-host
+// The single-field dialogs (MessageBox, Find, Replace, Go To Line, About) are
+// built from a tview.Form (inputs + checkboxes + stacked command buttons),
+// which handles its own Tab navigation. The composite file dialogs (Open,
+// Save As) instead use a flat ring of standalone controls — a File Name input,
+// two tview.List boxes (directories and files) and standalone buttons — owned
+// by a dlgFocusGroup that keeps the Application focus on itself so Tab/Shift+Tab
+// cycle reliably between the controls. Each constructor returns a ready-to-host
 // tview.Primitive plus a suggested width/height so the application can centre
 // the dialog inside a winman modal.
 //
@@ -249,7 +253,7 @@ func dlgResolveDir(start string) string {
 
 // dlgListEntries reads dir and returns the sorted directory names (with a
 // leading ".." entry unless at the filesystem root) and the sorted file names
-// matching filter (a glob like "*.BAS"; empty means all files).
+// matching filter (a glob like "*.*"; empty/"*"/"*.*" means all files).
 func dlgListEntries(dir, filter string) (dirs, files []string) {
 	dirs = []string{}
 	files = []string{}
@@ -302,7 +306,7 @@ func dlgMatchFilter(name, filter string) bool {
 // dlgFileDialog holds the shared state for the Open and Save As dialogs.
 type dlgFileDialog struct {
 	frame   *dlgFrame
-	form    *tview.Form
+	nameIn  *tview.InputField
 	pathTV  *tview.TextView
 	dirList *tview.List
 	fileLst *tview.List
@@ -312,21 +316,12 @@ type dlgFileDialog struct {
 
 // dlgNameField returns the current "File Name" input value.
 func (d *dlgFileDialog) dlgNameField() string {
-	if item := d.form.GetFormItemByLabel("File Name"); item != nil {
-		if in, ok := item.(*tview.InputField); ok {
-			return strings.TrimSpace(in.GetText())
-		}
-	}
-	return ""
+	return strings.TrimSpace(d.nameIn.GetText())
 }
 
 // dlgSetNameField sets the "File Name" input value.
 func (d *dlgFileDialog) dlgSetNameField(v string) {
-	if item := d.form.GetFormItemByLabel("File Name"); item != nil {
-		if in, ok := item.(*tview.InputField); ok {
-			in.SetText(v)
-		}
-	}
+	d.nameIn.SetText(v)
 }
 
 // dlgRefresh re-reads the current directory and repopulates the lists and the
@@ -367,7 +362,7 @@ func (d *dlgFileDialog) dlgChosenPath() string {
 	if name == "" {
 		return ""
 	}
-	// A bare glob filter (e.g. "*.BAS") is not a real selection.
+	// A bare glob filter (e.g. "*.*") is not a real selection.
 	if strings.ContainsAny(name, "*?") {
 		return ""
 	}
@@ -379,10 +374,24 @@ func (d *dlgFileDialog) dlgChosenPath() string {
 
 // dlgBuildFileDialog constructs the shared Open/Save As layout. okLabel is the
 // confirm button text ("OK" / "Save"); nameDefault seeds the File Name field.
+//
+// Focus moves between the four (plus) standalone controls — File Name input,
+// Directories list, Files list, and the OK / Cancel buttons — via Tab and
+// Shift+Tab. To make that work reliably the controls are placed in a flat ring
+// owned by a dlgFocusGroup, which keeps the tview Application focus on itself so
+// it sees every key (see dlgFocusGroup for the rationale). Using standalone
+// controls rather than a nested tview.Form avoids the Form's own Tab handling
+// swallowing the key.
 func dlgBuildFileDialog(title, startDir, filter, nameDefault, okLabel string, onOK func(path string), onCancel func()) (tview.Primitive, int, int) {
 	d := &dlgFileDialog{
 		dir:    dlgResolveDir(startDir),
 		filter: filter,
+	}
+
+	cancel := func() {
+		if onCancel != nil {
+			onCancel()
+		}
 	}
 
 	d.pathTV = tview.NewTextView()
@@ -396,29 +405,51 @@ func dlgBuildFileDialog(title, startDir, filter, nameDefault, okLabel string, on
 	d.fileLst = tview.NewList()
 	dlgStyleList(d.fileLst)
 
-	d.form = tview.NewForm()
-	dlgStyleForm(d.form)
-	d.form.AddInputField("File Name", nameDefault, 40, nil, nil)
-	d.form.AddButton(okLabel, func() {
+	d.nameIn = tview.NewInputField()
+	d.nameIn.SetLabel("File Name ")
+	d.nameIn.SetText(nameDefault)
+	d.nameIn.SetFieldWidth(40)
+	d.nameIn.SetLabelColor(theme.Black)
+	d.nameIn.SetFieldStyle(theme.InputField())
+	d.nameIn.SetBackgroundColor(theme.LGray)
+
+	okBtn := dlgButton(okLabel, func() {
 		if p := d.dlgChosenPath(); p != "" && onOK != nil {
 			onOK(p)
 		}
 	})
-	d.form.AddButton("Cancel", func() {
-		if onCancel != nil {
-			onCancel()
+	cancelBtn := dlgButton("Cancel", cancel)
+
+	// Esc cancels from any control.
+	escCapture := func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEscape {
+			cancel()
+			return nil
+		}
+		return event
+	}
+	d.nameIn.SetInputCapture(escCapture)
+	d.dirList.SetInputCapture(escCapture)
+	d.fileLst.SetInputCapture(escCapture)
+	okBtn.SetExitFunc(func(key tcell.Key) {
+		if key == tcell.KeyEscape {
+			cancel()
 		}
 	})
-	d.form.SetCancelFunc(func() {
-		if onCancel != nil {
-			onCancel()
+	cancelBtn.SetExitFunc(func(key tcell.Key) {
+		if key == tcell.KeyEscape {
+			cancel()
 		}
 	})
 
 	d.dlgRefresh()
 
-	// Compose: form (File Name + buttons) on top, current-path line, then the
-	// two lists side by side under "Directories" / "Files" captions.
+	// Compose: File Name input on top, current-path line, then the two lists
+	// side by side under "Directories" / "Files" captions, and the buttons row.
+	topRow := tview.NewFlex().SetDirection(tview.FlexColumn)
+	topRow.SetBackgroundColor(theme.LGray)
+	topRow.AddItem(d.nameIn, 0, 1, true)
+
 	dirsCol := tview.NewFlex().SetDirection(tview.FlexRow)
 	dirsCol.AddItem(dlgCaption("Directories"), 1, 0, false)
 	dirsCol.AddItem(d.dirList, 0, 1, true)
@@ -432,19 +463,40 @@ func dlgBuildFileDialog(title, startDir, filter, nameDefault, okLabel string, on
 	listsRow.AddItem(dlgSpacer(), 1, 0, false)
 	listsRow.AddItem(filesCol, 0, 1, false)
 
+	btnRow := tview.NewFlex().SetDirection(tview.FlexColumn)
+	btnRow.SetBackgroundColor(theme.LGray)
+	btnRow.AddItem(dlgSpacer(), 0, 1, false)
+	btnRow.AddItem(okBtn, len([]rune(okLabel))+4, 0, false)
+	btnRow.AddItem(dlgSpacer(), 1, 0, false)
+	btnRow.AddItem(cancelBtn, len("Cancel")+4, 0, false)
+
 	body := tview.NewFlex().SetDirection(tview.FlexRow)
 	body.SetBackgroundColor(theme.LGray)
-	body.AddItem(d.form, 3, 0, true)
+	body.AddItem(topRow, 1, 0, true)
 	body.AddItem(d.pathTV, 1, 0, false)
 	body.AddItem(dlgSpacer(), 1, 0, false)
 	body.AddItem(listsRow, 0, 1, false)
+	body.AddItem(dlgSpacer(), 1, 0, false)
+	body.AddItem(btnRow, 1, 0, false)
 
-	// Tab/Shift+Tab cycle focus across the form and the two lists.
-	order := []tview.Primitive{d.form, d.dirList, d.fileLst}
-	dlgInstallFocusCycle(body, order)
+	// Flat focus ring: File Name -> Directories -> Files -> OK -> Cancel.
+	ring := []tview.Primitive{d.nameIn, d.dirList, d.fileLst, okBtn, cancelBtn}
+	group := dlgNewFocusGroup(body, ring)
 
-	d.frame = dlgNewFrame(title, body)
+	d.frame = dlgNewFrame(title, group)
 	return d.frame, 54, 20
+}
+
+// dlgButton builds a standalone command button styled like the DOS dialog
+// buttons (light-grey face, reverse-video when focused).
+func dlgButton(label string, selected func()) *tview.Button {
+	b := tview.NewButton(label)
+	b.SetStyle(theme.ButtonFace())
+	b.SetActivatedStyle(tcell.StyleDefault.Foreground(theme.White).Background(theme.Black))
+	if selected != nil {
+		b.SetSelectedFunc(selected)
+	}
+	return b
 }
 
 // dlgCaption builds a small light-grey caption label used above list boxes.
@@ -463,48 +515,150 @@ func dlgSpacer() *tview.Box {
 	return b
 }
 
-// dlgInstallFocusCycle wires Tab/Shift+Tab on the container to rotate focus
-// through order. It relies on the container's input capture being available
-// through the Box embedded by Flex.
-func dlgInstallFocusCycle(container *tview.Flex, order []tview.Primitive) {
-	if len(order) == 0 {
+// dlgFocusGroup is a focus-owning container, modelled on the trick tview.Form
+// uses internally. It wraps a *tview.Flex purely for layout and drawing, but
+// holds a flat ordered ring of focusable leaf controls and rotates focus among
+// them on Tab / Shift+Tab.
+//
+// The crucial point: tview's Application delivers key events to the *focused
+// leaf primitive*, not through ancestor containers, so an input capture on a
+// plain container never sees Tab. dlgFocusGroup instead keeps the Application
+// focus on ITSELF (its Focus does not delegate down), so its InputHandler
+// receives every key. It then forwards non-Tab keys to the currently selected
+// child using the REAL setFocus, and handles Tab/Shift+Tab by advancing the
+// internal index and refocusing children internally.
+type dlgFocusGroup struct {
+	*tview.Box
+	layout *tview.Flex
+	ring   []tview.Primitive
+	index  int
+}
+
+// dlgNewFocusGroup builds a focus group drawing layout and cycling focus
+// through ring (which must be non-empty; entries should be leaf controls that
+// also appear somewhere inside layout).
+func dlgNewFocusGroup(layout *tview.Flex, ring []tview.Primitive) *dlgFocusGroup {
+	g := &dlgFocusGroup{
+		Box:    tview.NewBox(),
+		layout: layout,
+		ring:   ring,
+	}
+	g.Box.SetBackgroundColor(theme.LGray)
+	return g
+}
+
+// Draw lays out the group's rectangle onto the inner Flex and draws it.
+func (g *dlgFocusGroup) Draw(screen tcell.Screen) {
+	g.Box.DrawForSubclass(screen, g)
+	x, y, w, h := g.GetRect()
+	g.layout.SetRect(x, y, w, h)
+	g.layout.Draw(screen)
+}
+
+// dlgFocusChild gives internal focus to the ring entry at i and removes it from
+// every other ring entry (via a no-op delegate, which only flips the child's
+// internal focus flag — app focus stays on the group).
+func (g *dlgFocusGroup) dlgFocusChild(i int) {
+	if len(g.ring) == 0 {
 		return
 	}
-	focused := func() int {
-		for i, o := range order {
-			if o.HasFocus() {
-				return i
+	g.index = (i%len(g.ring) + len(g.ring)) % len(g.ring)
+	for j, c := range g.ring {
+		if j == g.index {
+			c.Focus(func(tview.Primitive) {})
+		} else if c.HasFocus() {
+			// Drop internal focus from the previously selected child so it
+			// stops drawing its cursor / selected styling.
+			c.Blur()
+		}
+	}
+}
+
+// Focus keeps the Application focus on the group itself and sets internal focus
+// on the current child. delegate is intentionally ignored.
+func (g *dlgFocusGroup) Focus(delegate func(p tview.Primitive)) {
+	g.Box.Focus(delegate)
+	g.dlgFocusChild(g.index)
+}
+
+// HasFocus reports focus on the group or any of its children.
+func (g *dlgFocusGroup) HasFocus() bool {
+	if g.Box.HasFocus() {
+		return true
+	}
+	for _, c := range g.ring {
+		if c.HasFocus() {
+			return true
+		}
+	}
+	return false
+}
+
+// dlgKeepFocus returns a setFocus wrapper that prevents a child from stealing
+// the Application focus away from the group: any request to focus a ring child
+// is redirected to focusing the group itself (which re-asserts the child's
+// internal focus). Requests to focus anything else (e.g. a future modal) are
+// passed through unchanged.
+func (g *dlgFocusGroup) dlgKeepFocus(setFocus func(p tview.Primitive)) func(p tview.Primitive) {
+	return func(p tview.Primitive) {
+		for _, c := range g.ring {
+			if c == p {
+				setFocus(g)
+				return
 			}
 		}
-		return 0
+		setFocus(p)
 	}
-	container.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+}
+
+// InputHandler rotates focus on Tab/Shift+Tab and forwards all other keys to
+// the current child.
+func (g *dlgFocusGroup) InputHandler() func(event *tcell.EventKey, setFocus func(p tview.Primitive)) {
+	return g.WrapInputHandler(func(event *tcell.EventKey, setFocus func(p tview.Primitive)) {
+		if len(g.ring) == 0 {
+			return
+		}
 		switch event.Key() {
 		case tcell.KeyTab:
-			i := focused()
-			dlgFocusPrimitive(order[(i+1)%len(order)])
-			return nil
+			g.dlgFocusChild(g.index + 1)
+			return
 		case tcell.KeyBacktab:
-			i := focused()
-			dlgFocusPrimitive(order[(i-1+len(order))%len(order)])
-			return nil
+			g.dlgFocusChild(g.index - 1)
+			return
 		}
-		return event
+		child := g.ring[g.index]
+		if h := child.InputHandler(); h != nil {
+			h(event, g.dlgKeepFocus(setFocus))
+		}
 	})
 }
 
-// dlgFocusPrimitive focuses p by delegating through its own Focus method.
-func dlgFocusPrimitive(p tview.Primitive) {
-	p.Focus(func(child tview.Primitive) {})
+// MouseHandler forwards mouse events to the children; a click on a control also
+// selects it in the ring so subsequent keys go there. Children that request
+// focus are redirected back to the group so it retains the Application focus.
+func (g *dlgFocusGroup) MouseHandler() func(action tview.MouseAction, event *tcell.EventMouse, setFocus func(p tview.Primitive)) (consumed bool, capture tview.Primitive) {
+	return g.WrapMouseHandler(func(action tview.MouseAction, event *tcell.EventMouse, setFocus func(p tview.Primitive)) (bool, tview.Primitive) {
+		keep := g.dlgKeepFocus(setFocus)
+		for i, c := range g.ring {
+			consumed, capture := c.MouseHandler()(action, event, keep)
+			if consumed {
+				if action == tview.MouseLeftDown || action == tview.MouseLeftClick {
+					g.dlgFocusChild(i)
+				}
+				return consumed, capture
+			}
+		}
+		return false, nil
+	})
 }
 
 // NewOpenDialog builds the modal File Open dialog. The File Name field
-// defaults to filter (e.g. "*.BAS"); selecting a file and confirming calls
+// defaults to filter (e.g. "*.*"); selecting a file and confirming calls
 // onOK with the full path. onCancel fires on Cancel/Esc.
 func NewOpenDialog(startDir, filter string, onOK func(path string), onCancel func()) (p tview.Primitive, w, h int) {
 	def := filter
 	if def == "" {
-		def = "*.BAS"
+		def = "*.*"
 	}
 	return dlgBuildFileDialog("Open", startDir, def, def, "OK", onOK, onCancel)
 }
@@ -514,7 +668,7 @@ func NewOpenDialog(startDir, filter string, onOK func(path string), onCancel fun
 // application may follow up with a confirm-overwrite MessageBox). onCancel
 // fires on Cancel/Esc.
 func NewSaveAsDialog(startDir, suggestedName string, onOK func(path string), onCancel func()) (tview.Primitive, int, int) {
-	filter := "*.BAS"
+	filter := "*.*"
 	return dlgBuildFileDialog("Save As", startDir, filter, suggestedName, "Save", onOK, onCancel)
 }
 

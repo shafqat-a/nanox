@@ -97,14 +97,14 @@ go get github.com/rivo/tview
 go get github.com/epiclabs-io/winman      # or github.com/r3ap3r2004/winman
 
 go run .                                   # run
-go build -o dosedit .                      # build current OS
+go build -o nanox .                        # build current OS (executable is named "nanox")
 go test ./...                              # all tests
 go test ./internal/buffer/ -run TestName   # a single test
 
 # cross-compile (static binary per OS)
-GOOS=windows GOARCH=amd64 go build -o dosedit.exe .
-GOOS=darwin  GOARCH=arm64 go build -o dosedit-macos .
-GOOS=linux   GOARCH=amd64 go build -o dosedit-linux .
+GOOS=windows GOARCH=amd64 go build -o nanox.exe .
+GOOS=darwin  GOARCH=arm64 go build -o nanox-macos .
+GOOS=linux   GOARCH=amd64 go build -o nanox-linux .
 ```
 
 ## Build order — milestones (spec §11)
