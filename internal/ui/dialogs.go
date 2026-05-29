@@ -1,21 +1,22 @@
 // This file implements DOSEdit's modal dialogs (spec §6.6): Open, Save As,
-// MessageBox, Find, Replace, Go To Line and About.
+// MessageBox, Find, Replace, Go To Line, Options and About.
 //
-// The single-field dialogs (MessageBox, Find, Replace, Go To Line, About) are
-// built from a tview.Form (inputs + checkboxes + stacked command buttons),
-// which handles its own Tab navigation. The composite file dialogs (Open,
-// Save As) instead use a flat ring of standalone controls — a File Name input,
-// two tview.List boxes (directories and files) and standalone buttons — owned
-// by a dlgFocusGroup that keeps the Application focus on itself so Tab/Shift+Tab
-// cycle reliably between the controls. Each constructor returns a ready-to-host
-// tview.Primitive plus a suggested width/height so the application can centre
-// the dialog inside a winman modal.
+// Every dialog is built on ONE unified Dialog primitive. A Dialog draws the DOS
+// chrome itself — a double-line frame, a centred magenta/white title bar, a
+// light-gray body and a one-cell solid-black drop shadow on the right and bottom
+// edges — and owns a flat ordered ring of focusable controls. Non-button
+// controls (input fields, checkboxes, lists, caption lines) stack vertically in
+// the body; command buttons (OK / Cancel / Help …) stack vertically down the
+// right-hand side, matching the VBDOS "New Form" template (spec §6.6).
 //
-// The visible chrome — the magenta title bar, light-grey body, double-line
-// frame and solid-black drop shadow — is drawn by the self-contained dlgFrame
-// primitive declared here, which wraps an inner primitive. Nothing in this
-// file references symbols from sibling files in package ui, and every
-// unexported identifier is prefixed dlg to avoid collisions.
+// The Dialog keeps the tview Application focus on ITSELF and forwards keys to the
+// currently focused control. tview delivers key events only to the focused leaf
+// primitive (not through ancestor containers), so a container input-capture never
+// sees Tab. By holding focus at the Dialog level we guarantee uniform, trapped
+// Tab/Shift+Tab cycling, Enter→default-button and Esc→cancel for every dialog.
+//
+// Nothing in this file references symbols from sibling files in package ui, and
+// every unexported identifier is prefixed dlg to avoid collisions.
 package ui
 
 import (
@@ -31,189 +32,9 @@ import (
 	"github.com/rivo/tview"
 )
 
-// dlgFrame wraps an inner primitive with a centred double-line frame, a
-// magenta title bar (white centred text), a light-grey body and a one-cell
-// solid-black drop shadow on the right and bottom edges. It is fully
-// self-contained: the inner primitive is laid out inside the frame and
-// receives all focus/input/mouse delegation.
-type dlgFrame struct {
-	*tview.Box
-	title string
-	inner tview.Primitive
-}
-
-// dlgNewFrame builds a frame around inner with the given title.
-func dlgNewFrame(title string, inner tview.Primitive) *dlgFrame {
-	f := &dlgFrame{
-		Box:   tview.NewBox(),
-		title: title,
-		inner: inner,
-	}
-	f.Box.SetBackgroundColor(theme.LGray)
-	return f
-}
-
-// dlgInnerRect returns the body rectangle available to the inner primitive,
-// i.e. the area inside the double frame, excluding the title row, the frame
-// borders and the one-cell shadow on the right/bottom.
-func (f *dlgFrame) dlgInnerRect() (int, int, int, int) {
-	x, y, w, h := f.GetRect()
-	// Reserve a one-cell shadow on the right and bottom.
-	fw := w - 1
-	fh := h - 1
-	if fw < 4 || fh < 4 {
-		// Degenerate; hand back whatever we have without crashing.
-		return x + 1, y + 1, dlgMaxInt(fw-2, 0), dlgMaxInt(fh-2, 0)
-	}
-	// Inside: skip left/right border (1 each), top border + title (2) and
-	// bottom border (1).
-	ix := x + 1
-	iy := y + 2
-	iw := fw - 2
-	ih := fh - 3
-	return ix, iy, iw, ih
-}
-
-// Draw paints the shadow, frame, title bar and body, then lays out and draws
-// the inner primitive.
-func (f *dlgFrame) Draw(screen tcell.Screen) {
-	f.Box.DrawForSubclass(screen, f)
-	x, y, w, h := f.GetRect()
-	if w < 4 || h < 3 {
-		return
-	}
-
-	fw := w - 1 // frame width  (shadow occupies the last column)
-	fh := h - 1 // frame height (shadow occupies the last row)
-	right := x + fw - 1
-	bottom := y + fh - 1
-
-	body := theme.DialogBody()
-	title := theme.DialogTitle()
-	shadow := theme.Shadow()
-
-	// Fill the body interior with the dialog background.
-	for row := y; row <= bottom; row++ {
-		for col := x; col <= right; col++ {
-			screen.SetContent(col, row, ' ', nil, body)
-		}
-	}
-
-	// Double-line frame.
-	screen.SetContent(x, y, theme.TLDouble, nil, body)
-	screen.SetContent(right, y, theme.TRDouble, nil, body)
-	screen.SetContent(x, bottom, theme.BLDouble, nil, body)
-	screen.SetContent(right, bottom, theme.BRDouble, nil, body)
-	for col := x + 1; col < right; col++ {
-		screen.SetContent(col, y, theme.HDouble, nil, body)
-		screen.SetContent(col, bottom, theme.HDouble, nil, body)
-	}
-	for row := y + 1; row < bottom; row++ {
-		screen.SetContent(x, row, theme.VDouble, nil, body)
-		screen.SetContent(right, row, theme.VDouble, nil, body)
-	}
-
-	// Magenta title bar on the row just below the top border.
-	titleRow := y + 1
-	if titleRow < bottom {
-		for col := x + 1; col < right; col++ {
-			screen.SetContent(col, titleRow, ' ', nil, title)
-		}
-		label := f.title
-		avail := fw - 2
-		if avail > 0 {
-			label = dlgClip(label, avail)
-			start := x + 1 + (avail-len(label))/2
-			for i, r := range []rune(label) {
-				screen.SetContent(start+i, titleRow, r, nil, title)
-			}
-		}
-	}
-
-	// Solid-black drop shadow: right column and bottom row, offset by one.
-	for row := y + 1; row <= bottom+1; row++ {
-		screen.SetContent(right+1, row, ' ', nil, shadow)
-	}
-	for col := x + 1; col <= right+1; col++ {
-		screen.SetContent(col, bottom+1, ' ', nil, shadow)
-	}
-
-	// Lay out and draw the inner primitive.
-	if f.inner != nil {
-		ix, iy, iw, ih := f.dlgInnerRect()
-		if iw > 0 && ih > 0 {
-			f.inner.SetRect(ix, iy, iw, ih)
-			f.inner.Draw(screen)
-		}
-	}
-}
-
-// Focus delegates focus to the inner primitive so keyboard navigation works.
-func (f *dlgFrame) Focus(delegate func(p tview.Primitive)) {
-	if f.inner != nil {
-		delegate(f.inner)
-		return
-	}
-	f.Box.Focus(delegate)
-}
-
-// HasFocus reports whether the inner primitive holds focus.
-func (f *dlgFrame) HasFocus() bool {
-	if f.inner != nil {
-		return f.inner.HasFocus()
-	}
-	return f.Box.HasFocus()
-}
-
-// InputHandler forwards keys to the inner primitive.
-func (f *dlgFrame) InputHandler() func(event *tcell.EventKey, setFocus func(p tview.Primitive)) {
-	return func(event *tcell.EventKey, setFocus func(p tview.Primitive)) {
-		if f.inner == nil {
-			return
-		}
-		if h := f.inner.InputHandler(); h != nil {
-			h(event, setFocus)
-		}
-	}
-}
-
-// MouseHandler forwards mouse events to the inner primitive.
-func (f *dlgFrame) MouseHandler() func(action tview.MouseAction, event *tcell.EventMouse, setFocus func(p tview.Primitive)) (consumed bool, capture tview.Primitive) {
-	return func(action tview.MouseAction, event *tcell.EventMouse, setFocus func(p tview.Primitive)) (bool, tview.Primitive) {
-		if f.inner == nil {
-			return false, nil
-		}
-		if h := f.inner.MouseHandler(); h != nil {
-			return h(action, event, setFocus)
-		}
-		return false, nil
-	}
-}
-
-// dlgStyleForm applies the shared DOS dialog styling to a Form: light-grey
-// body, white-on-black input fields and a light-grey button face with a
-// reverse-video treatment for the focused/default button.
-func dlgStyleForm(form *tview.Form) {
-	form.SetBackgroundColor(theme.LGray)
-	form.SetFieldStyle(theme.InputField())
-	form.SetLabelColor(theme.Black)
-	form.SetButtonStyle(theme.ButtonFace())
-	// Focused/default button: reverse video (white-on-black) so it reads as
-	// the active command, matching the VB-for-DOS default-button treatment.
-	form.SetButtonActivatedStyle(tcell.StyleDefault.Foreground(theme.White).Background(theme.Black))
-	form.SetButtonsAlign(tview.AlignRight)
-	form.SetItemPadding(0)
-}
-
-// dlgStyleList applies the black-on-white list-box styling with a reverse
-// selected row.
-func dlgStyleList(list *tview.List) {
-	list.ShowSecondaryText(false)
-	list.SetBackgroundColor(theme.White)
-	list.SetMainTextStyle(theme.ListBox())
-	list.SetSelectedStyle(theme.ListSelected())
-	list.SetWrapAround(true)
-}
+// ----------------------------------------------------------------------------
+// Small drawing helpers
+// ----------------------------------------------------------------------------
 
 // dlgClip truncates s to at most n runes.
 func dlgClip(s string, n int) string {
@@ -235,6 +56,503 @@ func dlgMaxInt(a, b int) int {
 	}
 	return b
 }
+
+// ----------------------------------------------------------------------------
+// Dialog: the unified modal primitive
+// ----------------------------------------------------------------------------
+
+// Dialog is the single modal primitive every DOSEdit dialog is built on. It
+// implements tview.Primitive and owns a flat ordered focus ring of controls,
+// drawing the DOS chrome (double frame, magenta title bar, light-gray body,
+// drop shadow) itself.
+type Dialog struct {
+	*tview.Box
+
+	title string
+
+	// body holds the non-button controls (inputs, checkboxes, lists, captions),
+	// stacked vertically in the left/main body area. buttons holds the command
+	// buttons, stacked vertically down the right-hand side.
+	body    []tview.Primitive
+	buttons []*tview.Button
+
+	// ring is the flat ordered focus ring: focusable body controls followed by
+	// the buttons. index is the currently focused entry.
+	ring  []tview.Primitive
+	index int
+
+	def    *tview.Button // Enter target; first button if unset
+	cancel func()        // Esc / Cancel action
+
+	width, height int
+}
+
+// NewDialog creates an empty Dialog with the given title and a sane default
+// size. Callers add controls via the builder methods, then SetSize as needed.
+func NewDialog(title string) *Dialog {
+	d := &Dialog{
+		Box:    tview.NewBox(),
+		title:  title,
+		width:  40,
+		height: 10,
+	}
+	d.Box.SetBackgroundColor(theme.LGray)
+	return d
+}
+
+// SetSize sets the dialog's outer size (including frame and shadow). The
+// application centres the dialog using Size().
+func (d *Dialog) SetSize(w, h int) {
+	d.width, d.height = w, h
+}
+
+// Size returns the dialog's outer size so the application can centre it.
+func (d *Dialog) Size() (w, h int) {
+	return d.width, d.height
+}
+
+// SetCancel sets the action invoked by Esc and by a Cancel button.
+func (d *Dialog) SetCancel(fn func()) {
+	d.cancel = fn
+}
+
+// SetDefault sets the button activated by Enter when focus is not on a button.
+func (d *Dialog) SetDefault(b *tview.Button) {
+	d.def = b
+}
+
+// dlgRegister adds a control to the focus ring.
+func (d *Dialog) dlgRegister(p tview.Primitive) {
+	d.ring = append(d.ring, p)
+}
+
+// rebuildRing recomputes the focus ring: focusable body controls first, then
+// the command buttons. (Non-focusable captions/path lines are excluded.)
+func (d *Dialog) rebuildRing() {
+	d.ring = d.ring[:0]
+	for _, p := range d.body {
+		if _, ok := p.(*tview.TextView); ok {
+			continue // captions / path lines are not focusable
+		}
+		d.ring = append(d.ring, p)
+	}
+	for _, b := range d.buttons {
+		d.ring = append(d.ring, b)
+	}
+	if d.index >= len(d.ring) {
+		d.index = 0
+	}
+}
+
+// ----------------------------------------------------------------------------
+// Builder API
+// ----------------------------------------------------------------------------
+
+// AddField adds a labelled white-on-black input field to the body and returns
+// it so callers can read the value.
+func (d *Dialog) AddField(label, value string, fieldWidth int) *tview.InputField {
+	in := tview.NewInputField()
+	in.SetLabel(label)
+	in.SetText(value)
+	in.SetFieldWidth(fieldWidth)
+	in.SetLabelColor(theme.Black)
+	in.SetFieldStyle(theme.InputField())
+	in.SetBackgroundColor(theme.LGray)
+	d.body = append(d.body, in)
+	d.rebuildRing()
+	return in
+}
+
+// AddCheckbox adds a labelled checkbox to the body and returns it.
+func (d *Dialog) AddCheckbox(label string, checked bool) *tview.Checkbox {
+	cb := tview.NewCheckbox()
+	cb.SetLabel(label + " ")
+	cb.SetChecked(checked)
+	cb.SetLabelColor(theme.Black)
+	cb.SetFieldTextColor(theme.White)
+	cb.SetFieldBackgroundColor(theme.Black)
+	cb.SetBackgroundColor(theme.LGray)
+	d.body = append(d.body, cb)
+	d.rebuildRing()
+	return cb
+}
+
+// AddList adds a black-on-white scrollable list box to the body and returns it.
+func (d *Dialog) AddList() *tview.List {
+	list := tview.NewList()
+	list.ShowSecondaryText(false)
+	list.SetBackgroundColor(theme.White)
+	list.SetMainTextStyle(theme.ListBox())
+	list.SetSelectedStyle(theme.ListSelected())
+	list.SetWrapAround(true)
+	d.body = append(d.body, list)
+	d.rebuildRing()
+	return list
+}
+
+// AddTextLine adds a non-focusable light-gray caption / path line to the body.
+func (d *Dialog) AddTextLine(text string) *tview.TextView {
+	tv := tview.NewTextView()
+	tv.SetText(text)
+	tv.SetWrap(false)
+	tv.SetTextStyle(theme.DialogBody())
+	tv.SetBackgroundColor(theme.LGray)
+	d.body = append(d.body, tv)
+	// captions are not focusable, but rebuildRing skips them anyway.
+	d.rebuildRing()
+	return tv
+}
+
+// AddButton adds a command button to the vertical button column and returns it.
+// The first button added becomes the default unless SetDefault overrides it.
+func (d *Dialog) AddButton(label string, action func()) *tview.Button {
+	b := tview.NewButton(label)
+	b.SetStyle(theme.ButtonFace())
+	// Focused/default button: reverse video (white-on-black), matching the
+	// VB-for-DOS default-button treatment.
+	b.SetActivatedStyle(tcell.StyleDefault.Foreground(theme.White).Background(theme.Black))
+	if action != nil {
+		b.SetSelectedFunc(action)
+	}
+	d.buttons = append(d.buttons, b)
+	if d.def == nil {
+		d.def = b
+	}
+	d.rebuildRing()
+	return b
+}
+
+// ----------------------------------------------------------------------------
+// Layout + drawing
+// ----------------------------------------------------------------------------
+
+// frameRect returns the frame rectangle (excluding the one-cell shadow on the
+// right/bottom) given the dialog's outer rect.
+func (d *Dialog) frameRect() (x, y, w, h int) {
+	x, y, ow, oh := d.GetRect()
+	w = ow - 1 // shadow occupies the last column
+	h = oh - 1 // shadow occupies the last row
+	if w < 1 {
+		w = ow
+	}
+	if h < 1 {
+		h = oh
+	}
+	return x, y, w, h
+}
+
+// innerRect returns the body rectangle inside the frame: skip the left/right
+// borders, the top border + title row, and the bottom border.
+func (d *Dialog) innerRect() (int, int, int, int) {
+	x, y, w, h := d.frameRect()
+	if w < 4 || h < 4 {
+		return x + 1, y + 1, dlgMaxInt(w-2, 0), dlgMaxInt(h-2, 0)
+	}
+	return x + 1, y + 2, w - 2, h - 3
+}
+
+// layout positions every body control and button within the inner rectangle.
+// Body controls stack vertically on the left; buttons stack vertically down a
+// fixed-width column on the right.
+func (d *Dialog) layout() {
+	ix, iy, iw, ih := d.innerRect()
+	if iw <= 0 || ih <= 0 {
+		return
+	}
+
+	// Right-hand button column width = widest button label + 4 (padding), if any.
+	btnW := 0
+	for _, b := range d.buttons {
+		if w := len([]rune(b.GetLabel())) + 4; w > btnW {
+			btnW = w
+		}
+	}
+	gap := 0
+	if btnW > 0 {
+		gap = 2
+	}
+	// Clamp so the body keeps at least a few columns on tiny terminals.
+	if btnW+gap >= iw {
+		btnW = dlgMaxInt(iw/3, 0)
+		gap = 0
+	}
+
+	bodyX := ix + 1
+	bodyW := iw - 2 - btnW - gap
+	if bodyW < 1 {
+		bodyW = dlgMaxInt(iw-2, 1)
+	}
+
+	// Stack body controls vertically. Lists are greedy (share the remaining
+	// height); single-line controls take one row.
+	var lists []tview.Primitive
+	fixedRows := 0
+	for _, p := range d.body {
+		if _, ok := p.(*tview.List); ok {
+			lists = append(lists, p)
+		} else {
+			fixedRows++
+		}
+	}
+	avail := ih - fixedRows
+	if avail < 0 {
+		avail = 0
+	}
+	listH := 0
+	if len(lists) > 0 {
+		listH = avail / len(lists)
+		if listH < 1 {
+			listH = 1
+		}
+	}
+
+	row := iy
+	bottom := iy + ih
+	for _, p := range d.body {
+		if row >= bottom {
+			p.SetRect(bodyX, bottom-1, bodyW, 0)
+			continue
+		}
+		h := 1
+		if _, ok := p.(*tview.List); ok {
+			h = listH
+			if row+h > bottom {
+				h = bottom - row
+			}
+		}
+		p.SetRect(bodyX, row, bodyW, h)
+		row += h
+	}
+
+	// Buttons: vertical column on the right, top-aligned.
+	if btnW > 0 {
+		bx := ix + iw - btnW
+		by := iy
+		for _, b := range d.buttons {
+			if by >= bottom {
+				b.SetRect(bx, bottom-1, btnW, 0)
+				continue
+			}
+			b.SetRect(bx, by, btnW, 1)
+			by += 2 // one blank row between buttons
+		}
+	}
+}
+
+// Draw paints the chrome (shadow, frame, title bar, body fill) then lays out and
+// draws every control. It is robust on small terminals and never panics.
+func (d *Dialog) Draw(screen tcell.Screen) {
+	d.Box.DrawForSubclass(screen, d)
+
+	ox, oy, ow, oh := d.GetRect()
+	if ow < 4 || oh < 3 {
+		return
+	}
+
+	fx, fy, fw, fh := d.frameRect()
+	right := fx + fw - 1
+	bottom := fy + fh - 1
+
+	body := theme.DialogBody()
+	title := theme.DialogTitle()
+	shadow := theme.Shadow()
+
+	// Fill the frame interior with the dialog background.
+	for r := fy; r <= bottom; r++ {
+		for c := fx; c <= right; c++ {
+			screen.SetContent(c, r, ' ', nil, body)
+		}
+	}
+
+	// Double-line frame.
+	screen.SetContent(fx, fy, theme.TLDouble, nil, body)
+	screen.SetContent(right, fy, theme.TRDouble, nil, body)
+	screen.SetContent(fx, bottom, theme.BLDouble, nil, body)
+	screen.SetContent(right, bottom, theme.BRDouble, nil, body)
+	for c := fx + 1; c < right; c++ {
+		screen.SetContent(c, fy, theme.HDouble, nil, body)
+		screen.SetContent(c, bottom, theme.HDouble, nil, body)
+	}
+	for r := fy + 1; r < bottom; r++ {
+		screen.SetContent(fx, r, theme.VDouble, nil, body)
+		screen.SetContent(right, r, theme.VDouble, nil, body)
+	}
+
+	// Magenta title bar on the row just below the top border.
+	titleRow := fy + 1
+	if titleRow < bottom {
+		for c := fx + 1; c < right; c++ {
+			screen.SetContent(c, titleRow, ' ', nil, title)
+		}
+		avail := fw - 2
+		if avail > 0 {
+			label := dlgClip(d.title, avail)
+			start := fx + 1 + (avail-len([]rune(label)))/2
+			for i, r := range []rune(label) {
+				screen.SetContent(start+i, titleRow, r, nil, title)
+			}
+		}
+	}
+
+	// Solid-black drop shadow: right column and bottom row, offset by one.
+	maxX := ox + ow - 1
+	maxY := oy + oh - 1
+	for r := fy + 1; r <= bottom+1 && r <= maxY; r++ {
+		screen.SetContent(right+1, r, ' ', nil, shadow)
+	}
+	for c := fx + 1; c <= right+1 && c <= maxX; c++ {
+		screen.SetContent(c, bottom+1, ' ', nil, shadow)
+	}
+
+	// Lay out and draw all controls.
+	d.layout()
+	for _, p := range d.body {
+		_, _, w, h := p.GetRect()
+		if w > 0 && h > 0 {
+			p.Draw(screen)
+		}
+	}
+	for _, b := range d.buttons {
+		_, _, w, h := b.GetRect()
+		if w > 0 && h > 0 {
+			b.Draw(screen)
+		}
+	}
+}
+
+// ----------------------------------------------------------------------------
+// Focus + input
+// ----------------------------------------------------------------------------
+
+// focusRing gives internal focus to ring entry i and drops it from the others.
+// The Application focus stays on the Dialog; only the child's internal focus
+// flag flips (via a no-op delegate).
+func (d *Dialog) focusRing(i int) {
+	if len(d.ring) == 0 {
+		return
+	}
+	d.index = (i%len(d.ring) + len(d.ring)) % len(d.ring)
+	for j, c := range d.ring {
+		if j == d.index {
+			c.Focus(func(tview.Primitive) {})
+		} else if c.HasFocus() {
+			c.Blur()
+		}
+	}
+}
+
+// Focus keeps the Application focus on the Dialog itself and asserts internal
+// focus on the current control. delegate is intentionally ignored.
+func (d *Dialog) Focus(delegate func(p tview.Primitive)) {
+	d.Box.Focus(delegate)
+	d.focusRing(d.index)
+}
+
+// HasFocus reports focus on the Dialog or any of its controls.
+func (d *Dialog) HasFocus() bool {
+	if d.Box.HasFocus() {
+		return true
+	}
+	for _, c := range d.ring {
+		if c.HasFocus() {
+			return true
+		}
+	}
+	return false
+}
+
+// keepFocus wraps setFocus so a control cannot steal the Application focus away
+// from the Dialog: any request to focus a ring control is redirected to focusing
+// the Dialog itself (which re-asserts the child's internal focus). Requests for
+// anything else pass through unchanged.
+func (d *Dialog) keepFocus(setFocus func(p tview.Primitive)) func(p tview.Primitive) {
+	return func(p tview.Primitive) {
+		for _, c := range d.ring {
+			if c == p {
+				setFocus(d)
+				return
+			}
+		}
+		setFocus(p)
+	}
+}
+
+// currentIsButton reports whether the focused ring entry is a command button.
+func (d *Dialog) currentIsButton() (*tview.Button, bool) {
+	if d.index < 0 || d.index >= len(d.ring) {
+		return nil, false
+	}
+	b, ok := d.ring[d.index].(*tview.Button)
+	return b, ok
+}
+
+// fire activates a button's selected handler.
+func dlgFire(b *tview.Button) {
+	if b == nil || b.IsDisabled() {
+		return
+	}
+	if h := b.InputHandler(); h != nil {
+		h(tcell.NewEventKey(tcell.KeyEnter, '\r', tcell.ModNone), func(tview.Primitive) {})
+	}
+}
+
+// InputHandler implements the uniform key semantics: Tab/Shift+Tab cycle the
+// (trapped) focus ring, Enter activates the focused button or the default
+// button, Esc invokes the cancel action, and all other keys are forwarded to
+// the focused control.
+func (d *Dialog) InputHandler() func(event *tcell.EventKey, setFocus func(p tview.Primitive)) {
+	return d.WrapInputHandler(func(event *tcell.EventKey, setFocus func(p tview.Primitive)) {
+		switch event.Key() {
+		case tcell.KeyTab:
+			d.focusRing(d.index + 1)
+			return
+		case tcell.KeyBacktab:
+			d.focusRing(d.index - 1)
+			return
+		case tcell.KeyEscape:
+			if d.cancel != nil {
+				d.cancel()
+			}
+			return
+		case tcell.KeyEnter:
+			if b, ok := d.currentIsButton(); ok {
+				dlgFire(b)
+				return
+			}
+			dlgFire(d.def)
+			return
+		}
+		if len(d.ring) == 0 {
+			return
+		}
+		child := d.ring[d.index]
+		if h := child.InputHandler(); h != nil {
+			h(event, d.keepFocus(setFocus))
+		}
+	})
+}
+
+// MouseHandler forwards mouse events to the controls; a left click on a control
+// also selects it in the focus ring so subsequent keys go there.
+func (d *Dialog) MouseHandler() func(action tview.MouseAction, event *tcell.EventMouse, setFocus func(p tview.Primitive)) (consumed bool, capture tview.Primitive) {
+	return d.WrapMouseHandler(func(action tview.MouseAction, event *tcell.EventMouse, setFocus func(p tview.Primitive)) (bool, tview.Primitive) {
+		keep := d.keepFocus(setFocus)
+		for i, c := range d.ring {
+			consumed, capture := c.MouseHandler()(action, event, keep)
+			if consumed {
+				if action == tview.MouseLeftDown || action == tview.MouseLeftClick {
+					d.focusRing(i)
+				}
+				return consumed, capture
+			}
+		}
+		return false, nil
+	})
+}
+
+// ----------------------------------------------------------------------------
+// File dialog support (Open / Save As)
+// ----------------------------------------------------------------------------
 
 // dlgResolveDir returns an absolute, cleaned directory path, defaulting to the
 // current working directory when start is empty or unusable.
@@ -305,7 +623,6 @@ func dlgMatchFilter(name, filter string) bool {
 
 // dlgFileDialog holds the shared state for the Open and Save As dialogs.
 type dlgFileDialog struct {
-	frame   *dlgFrame
 	nameIn  *tview.InputField
 	pathTV  *tview.TextView
 	dirList *tview.List
@@ -314,348 +631,106 @@ type dlgFileDialog struct {
 	filter  string
 }
 
-// dlgNameField returns the current "File Name" input value.
-func (d *dlgFileDialog) dlgNameField() string {
-	return strings.TrimSpace(d.nameIn.GetText())
+// nameField returns the trimmed "File Name" input value.
+func (s *dlgFileDialog) nameField() string {
+	return strings.TrimSpace(s.nameIn.GetText())
 }
 
-// dlgSetNameField sets the "File Name" input value.
-func (d *dlgFileDialog) dlgSetNameField(v string) {
-	d.nameIn.SetText(v)
-}
-
-// dlgRefresh re-reads the current directory and repopulates the lists and the
+// refresh re-reads the current directory and repopulates the lists and the
 // current-path line.
-func (d *dlgFileDialog) dlgRefresh() {
-	d.pathTV.SetText(dlgClip(d.dir, 200))
-	dirs, files := dlgListEntries(d.dir, d.filter)
+func (s *dlgFileDialog) refresh() {
+	s.pathTV.SetText(dlgClip(s.dir, 200))
+	dirs, files := dlgListEntries(s.dir, s.filter)
 
-	d.dirList.Clear()
+	s.dirList.Clear()
 	for _, name := range dirs {
 		nm := name
-		d.dirList.AddItem("["+nm+"]", "", 0, func() {
+		s.dirList.AddItem("["+nm+"]", "", 0, func() {
 			var next string
 			if nm == ".." {
-				next = filepath.Dir(d.dir)
+				next = filepath.Dir(s.dir)
 			} else {
-				next = filepath.Join(d.dir, nm)
+				next = filepath.Join(s.dir, nm)
 			}
-			d.dir = dlgResolveDir(next)
-			d.dlgRefresh()
+			s.dir = dlgResolveDir(next)
+			s.refresh()
 		})
 	}
 
-	d.fileLst.Clear()
+	s.fileLst.Clear()
 	for _, name := range files {
 		nm := name
-		d.fileLst.AddItem(nm, "", 0, func() {
-			d.dlgSetNameField(nm)
+		s.fileLst.AddItem(nm, "", 0, func() {
+			s.nameIn.SetText(nm)
 		})
 	}
 }
 
-// dlgChosenPath resolves the current "File Name" field against the current
+// chosenPath resolves the current "File Name" field against the current
 // directory, returning the absolute path to hand to onOK. Returns "" when the
-// field is empty.
-func (d *dlgFileDialog) dlgChosenPath() string {
-	name := d.dlgNameField()
+// field is empty or holds a bare glob.
+func (s *dlgFileDialog) chosenPath() string {
+	name := s.nameField()
 	if name == "" {
 		return ""
 	}
-	// A bare glob filter (e.g. "*.*") is not a real selection.
 	if strings.ContainsAny(name, "*?") {
 		return ""
 	}
 	if filepath.IsAbs(name) {
 		return filepath.Clean(name)
 	}
-	return filepath.Join(d.dir, name)
+	return filepath.Join(s.dir, name)
 }
 
-// dlgBuildFileDialog constructs the shared Open/Save As layout. okLabel is the
-// confirm button text ("OK" / "Save"); nameDefault seeds the File Name field.
-//
-// Focus moves between the four (plus) standalone controls — File Name input,
-// Directories list, Files list, and the OK / Cancel buttons — via Tab and
-// Shift+Tab. To make that work reliably the controls are placed in a flat ring
-// owned by a dlgFocusGroup, which keeps the tview Application focus on itself so
-// it sees every key (see dlgFocusGroup for the rationale). Using standalone
-// controls rather than a nested tview.Form avoids the Form's own Tab handling
-// swallowing the key.
-func dlgBuildFileDialog(title, startDir, filter, nameDefault, okLabel string, onOK func(path string), onCancel func()) (tview.Primitive, int, int) {
-	d := &dlgFileDialog{
+// dlgBuildFileDialog constructs the shared Open/Save As layout: a File Name
+// field, a current-path line, side-by-side Directories and Files lists, and
+// OK / Cancel buttons stacked down the right. It preserves the original
+// navigation behaviour (".." and subdirs via os.ReadDir, dir-select refreshes,
+// file-select fills the name field, OK resolves the full path).
+func dlgBuildFileDialog(title, startDir, filter, nameDefault, okLabel string, onOK func(path string), onCancel func()) *Dialog {
+	s := &dlgFileDialog{
 		dir:    dlgResolveDir(startDir),
 		filter: filter,
 	}
+
+	d := NewDialog(title)
+	d.SetSize(54, 20)
 
 	cancel := func() {
 		if onCancel != nil {
 			onCancel()
 		}
 	}
+	d.SetCancel(cancel)
 
-	d.pathTV = tview.NewTextView()
-	d.pathTV.SetDynamicColors(false)
-	d.pathTV.SetTextStyle(theme.DialogBody())
-	d.pathTV.SetBackgroundColor(theme.LGray)
-	d.pathTV.SetWrap(false)
+	// Body: File Name field, current-path line, Directories list, Files list.
+	s.nameIn = d.AddField("File Name ", nameDefault, 40)
+	s.pathTV = d.AddTextLine("")
+	s.dirList = d.AddList()
+	s.fileLst = d.AddList()
 
-	d.dirList = tview.NewList()
-	dlgStyleList(d.dirList)
-	d.fileLst = tview.NewList()
-	dlgStyleList(d.fileLst)
+	s.refresh()
 
-	d.nameIn = tview.NewInputField()
-	d.nameIn.SetLabel("File Name ")
-	d.nameIn.SetText(nameDefault)
-	d.nameIn.SetFieldWidth(40)
-	d.nameIn.SetLabelColor(theme.Black)
-	d.nameIn.SetFieldStyle(theme.InputField())
-	d.nameIn.SetBackgroundColor(theme.LGray)
-
-	okBtn := dlgButton(okLabel, func() {
-		if p := d.dlgChosenPath(); p != "" && onOK != nil {
+	okBtn := d.AddButton(okLabel, func() {
+		if p := s.chosenPath(); p != "" && onOK != nil {
 			onOK(p)
 		}
 	})
-	cancelBtn := dlgButton("Cancel", cancel)
+	d.AddButton("Cancel", cancel)
+	d.SetDefault(okBtn)
 
-	// Esc cancels from any control.
-	escCapture := func(event *tcell.EventKey) *tcell.EventKey {
-		if event.Key() == tcell.KeyEscape {
-			cancel()
-			return nil
-		}
-		return event
-	}
-	d.nameIn.SetInputCapture(escCapture)
-	d.dirList.SetInputCapture(escCapture)
-	d.fileLst.SetInputCapture(escCapture)
-	okBtn.SetExitFunc(func(key tcell.Key) {
-		if key == tcell.KeyEscape {
-			cancel()
-		}
-	})
-	cancelBtn.SetExitFunc(func(key tcell.Key) {
-		if key == tcell.KeyEscape {
-			cancel()
-		}
-	})
-
-	d.dlgRefresh()
-
-	// Compose: File Name input on top, current-path line, then the two lists
-	// side by side under "Directories" / "Files" captions, and the buttons row.
-	topRow := tview.NewFlex().SetDirection(tview.FlexColumn)
-	topRow.SetBackgroundColor(theme.LGray)
-	topRow.AddItem(d.nameIn, 0, 1, true)
-
-	dirsCol := tview.NewFlex().SetDirection(tview.FlexRow)
-	dirsCol.AddItem(dlgCaption("Directories"), 1, 0, false)
-	dirsCol.AddItem(d.dirList, 0, 1, true)
-
-	filesCol := tview.NewFlex().SetDirection(tview.FlexRow)
-	filesCol.AddItem(dlgCaption("Files"), 1, 0, false)
-	filesCol.AddItem(d.fileLst, 0, 1, false)
-
-	listsRow := tview.NewFlex().SetDirection(tview.FlexColumn)
-	listsRow.AddItem(dirsCol, 0, 1, true)
-	listsRow.AddItem(dlgSpacer(), 1, 0, false)
-	listsRow.AddItem(filesCol, 0, 1, false)
-
-	btnRow := tview.NewFlex().SetDirection(tview.FlexColumn)
-	btnRow.SetBackgroundColor(theme.LGray)
-	btnRow.AddItem(dlgSpacer(), 0, 1, false)
-	btnRow.AddItem(okBtn, len([]rune(okLabel))+4, 0, false)
-	btnRow.AddItem(dlgSpacer(), 1, 0, false)
-	btnRow.AddItem(cancelBtn, len("Cancel")+4, 0, false)
-
-	body := tview.NewFlex().SetDirection(tview.FlexRow)
-	body.SetBackgroundColor(theme.LGray)
-	body.AddItem(topRow, 1, 0, true)
-	body.AddItem(d.pathTV, 1, 0, false)
-	body.AddItem(dlgSpacer(), 1, 0, false)
-	body.AddItem(listsRow, 0, 1, false)
-	body.AddItem(dlgSpacer(), 1, 0, false)
-	body.AddItem(btnRow, 1, 0, false)
-
-	// Flat focus ring: File Name -> Directories -> Files -> OK -> Cancel.
-	ring := []tview.Primitive{d.nameIn, d.dirList, d.fileLst, okBtn, cancelBtn}
-	group := dlgNewFocusGroup(body, ring)
-
-	d.frame = dlgNewFrame(title, group)
-	return d.frame, 54, 20
+	return d
 }
 
-// dlgButton builds a standalone command button styled like the DOS dialog
-// buttons (light-grey face, reverse-video when focused).
-func dlgButton(label string, selected func()) *tview.Button {
-	b := tview.NewButton(label)
-	b.SetStyle(theme.ButtonFace())
-	b.SetActivatedStyle(tcell.StyleDefault.Foreground(theme.White).Background(theme.Black))
-	if selected != nil {
-		b.SetSelectedFunc(selected)
-	}
-	return b
-}
+// ----------------------------------------------------------------------------
+// Public constructors
+// ----------------------------------------------------------------------------
 
-// dlgCaption builds a small light-grey caption label used above list boxes.
-func dlgCaption(text string) *tview.TextView {
-	tv := tview.NewTextView()
-	tv.SetText(text)
-	tv.SetTextStyle(theme.DialogBody())
-	tv.SetBackgroundColor(theme.LGray)
-	return tv
-}
-
-// dlgSpacer is a blank light-grey filler primitive.
-func dlgSpacer() *tview.Box {
-	b := tview.NewBox()
-	b.SetBackgroundColor(theme.LGray)
-	return b
-}
-
-// dlgFocusGroup is a focus-owning container, modelled on the trick tview.Form
-// uses internally. It wraps a *tview.Flex purely for layout and drawing, but
-// holds a flat ordered ring of focusable leaf controls and rotates focus among
-// them on Tab / Shift+Tab.
-//
-// The crucial point: tview's Application delivers key events to the *focused
-// leaf primitive*, not through ancestor containers, so an input capture on a
-// plain container never sees Tab. dlgFocusGroup instead keeps the Application
-// focus on ITSELF (its Focus does not delegate down), so its InputHandler
-// receives every key. It then forwards non-Tab keys to the currently selected
-// child using the REAL setFocus, and handles Tab/Shift+Tab by advancing the
-// internal index and refocusing children internally.
-type dlgFocusGroup struct {
-	*tview.Box
-	layout *tview.Flex
-	ring   []tview.Primitive
-	index  int
-}
-
-// dlgNewFocusGroup builds a focus group drawing layout and cycling focus
-// through ring (which must be non-empty; entries should be leaf controls that
-// also appear somewhere inside layout).
-func dlgNewFocusGroup(layout *tview.Flex, ring []tview.Primitive) *dlgFocusGroup {
-	g := &dlgFocusGroup{
-		Box:    tview.NewBox(),
-		layout: layout,
-		ring:   ring,
-	}
-	g.Box.SetBackgroundColor(theme.LGray)
-	return g
-}
-
-// Draw lays out the group's rectangle onto the inner Flex and draws it.
-func (g *dlgFocusGroup) Draw(screen tcell.Screen) {
-	g.Box.DrawForSubclass(screen, g)
-	x, y, w, h := g.GetRect()
-	g.layout.SetRect(x, y, w, h)
-	g.layout.Draw(screen)
-}
-
-// dlgFocusChild gives internal focus to the ring entry at i and removes it from
-// every other ring entry (via a no-op delegate, which only flips the child's
-// internal focus flag — app focus stays on the group).
-func (g *dlgFocusGroup) dlgFocusChild(i int) {
-	if len(g.ring) == 0 {
-		return
-	}
-	g.index = (i%len(g.ring) + len(g.ring)) % len(g.ring)
-	for j, c := range g.ring {
-		if j == g.index {
-			c.Focus(func(tview.Primitive) {})
-		} else if c.HasFocus() {
-			// Drop internal focus from the previously selected child so it
-			// stops drawing its cursor / selected styling.
-			c.Blur()
-		}
-	}
-}
-
-// Focus keeps the Application focus on the group itself and sets internal focus
-// on the current child. delegate is intentionally ignored.
-func (g *dlgFocusGroup) Focus(delegate func(p tview.Primitive)) {
-	g.Box.Focus(delegate)
-	g.dlgFocusChild(g.index)
-}
-
-// HasFocus reports focus on the group or any of its children.
-func (g *dlgFocusGroup) HasFocus() bool {
-	if g.Box.HasFocus() {
-		return true
-	}
-	for _, c := range g.ring {
-		if c.HasFocus() {
-			return true
-		}
-	}
-	return false
-}
-
-// dlgKeepFocus returns a setFocus wrapper that prevents a child from stealing
-// the Application focus away from the group: any request to focus a ring child
-// is redirected to focusing the group itself (which re-asserts the child's
-// internal focus). Requests to focus anything else (e.g. a future modal) are
-// passed through unchanged.
-func (g *dlgFocusGroup) dlgKeepFocus(setFocus func(p tview.Primitive)) func(p tview.Primitive) {
-	return func(p tview.Primitive) {
-		for _, c := range g.ring {
-			if c == p {
-				setFocus(g)
-				return
-			}
-		}
-		setFocus(p)
-	}
-}
-
-// InputHandler rotates focus on Tab/Shift+Tab and forwards all other keys to
-// the current child.
-func (g *dlgFocusGroup) InputHandler() func(event *tcell.EventKey, setFocus func(p tview.Primitive)) {
-	return g.WrapInputHandler(func(event *tcell.EventKey, setFocus func(p tview.Primitive)) {
-		if len(g.ring) == 0 {
-			return
-		}
-		switch event.Key() {
-		case tcell.KeyTab:
-			g.dlgFocusChild(g.index + 1)
-			return
-		case tcell.KeyBacktab:
-			g.dlgFocusChild(g.index - 1)
-			return
-		}
-		child := g.ring[g.index]
-		if h := child.InputHandler(); h != nil {
-			h(event, g.dlgKeepFocus(setFocus))
-		}
-	})
-}
-
-// MouseHandler forwards mouse events to the children; a click on a control also
-// selects it in the ring so subsequent keys go there. Children that request
-// focus are redirected back to the group so it retains the Application focus.
-func (g *dlgFocusGroup) MouseHandler() func(action tview.MouseAction, event *tcell.EventMouse, setFocus func(p tview.Primitive)) (consumed bool, capture tview.Primitive) {
-	return g.WrapMouseHandler(func(action tview.MouseAction, event *tcell.EventMouse, setFocus func(p tview.Primitive)) (bool, tview.Primitive) {
-		keep := g.dlgKeepFocus(setFocus)
-		for i, c := range g.ring {
-			consumed, capture := c.MouseHandler()(action, event, keep)
-			if consumed {
-				if action == tview.MouseLeftDown || action == tview.MouseLeftClick {
-					g.dlgFocusChild(i)
-				}
-				return consumed, capture
-			}
-		}
-		return false, nil
-	})
-}
-
-// NewOpenDialog builds the modal File Open dialog. The File Name field
-// defaults to filter (e.g. "*.*"); selecting a file and confirming calls
-// onOK with the full path. onCancel fires on Cancel/Esc.
-func NewOpenDialog(startDir, filter string, onOK func(path string), onCancel func()) (p tview.Primitive, w, h int) {
+// NewOpenDialog builds the modal File Open dialog. The File Name field defaults
+// to filter (e.g. "*.*"); selecting a file and confirming calls onOK with the
+// full path. onCancel fires on Cancel/Esc.
+func NewOpenDialog(startDir, filter string, onOK func(path string), onCancel func()) *Dialog {
 	def := filter
 	if def == "" {
 		def = "*.*"
@@ -663,52 +738,45 @@ func NewOpenDialog(startDir, filter string, onOK func(path string), onCancel fun
 	return dlgBuildFileDialog("Open", startDir, def, def, "OK", onOK, onCancel)
 }
 
-// NewSaveAsDialog builds the modal Save As dialog. The File Name field is
-// seeded with suggestedName; confirming calls onOK with the full path (the
-// application may follow up with a confirm-overwrite MessageBox). onCancel
-// fires on Cancel/Esc.
-func NewSaveAsDialog(startDir, suggestedName string, onOK func(path string), onCancel func()) (tview.Primitive, int, int) {
-	filter := "*.*"
-	return dlgBuildFileDialog("Save As", startDir, filter, suggestedName, "Save", onOK, onCancel)
+// NewSaveAsDialog builds the modal Save As dialog. The File Name field is seeded
+// with suggestedName; confirming calls onOK with the full path. onCancel fires
+// on Cancel/Esc.
+func NewSaveAsDialog(startDir, suggestedName string, onOK func(path string), onCancel func()) *Dialog {
+	return dlgBuildFileDialog("Save As", startDir, "*.*", suggestedName, "Save", onOK, onCancel)
 }
 
-// NewMessageBox builds a modal message box with a centred message and the
-// given buttons stacked down the right. onResult receives the pressed button
-// index, or -1 when dismissed with Esc.
-func NewMessageBox(title, message string, buttons []string, onResult func(idx int)) (tview.Primitive, int, int) {
+// NewMessageBox builds a modal message box with a centred message and the given
+// buttons stacked down the right. onResult receives the pressed button index,
+// or -1 when dismissed with Esc.
+func NewMessageBox(title, message string, buttons []string, onResult func(idx int)) *Dialog {
 	if len(buttons) == 0 {
 		buttons = []string{"OK"}
 	}
 
-	msg := tview.NewTextView()
-	msg.SetText(message)
+	d := NewDialog(title)
+
+	msg := d.AddTextLine(message)
 	msg.SetWrap(true)
 	msg.SetTextAlign(tview.AlignCenter)
-	msg.SetTextStyle(theme.DialogBody())
-	msg.SetBackgroundColor(theme.LGray)
 
-	form := tview.NewForm()
-	dlgStyleForm(form)
-	for i, label := range buttons {
-		idx := i
-		form.AddButton(label, func() {
-			if onResult != nil {
-				onResult(idx)
-			}
-		})
-	}
-	form.SetCancelFunc(func() {
+	d.SetCancel(func() {
 		if onResult != nil {
 			onResult(-1)
 		}
 	})
+	for i, label := range buttons {
+		idx := i
+		b := d.AddButton(label, func() {
+			if onResult != nil {
+				onResult(idx)
+			}
+		})
+		if i == 0 {
+			d.SetDefault(b)
+		}
+	}
 
-	body := tview.NewFlex().SetDirection(tview.FlexRow)
-	body.SetBackgroundColor(theme.LGray)
-	body.AddItem(msg, 0, 1, false)
-	body.AddItem(form, 1, 0, true)
-
-	// Width: fit the message and buttons, clamped to a sane range.
+	// Size: fit the message and the widest button.
 	lines := strings.Split(message, "\n")
 	maxLine := 0
 	for _, ln := range lines {
@@ -716,165 +784,117 @@ func NewMessageBox(title, message string, buttons []string, onResult func(idx in
 			maxLine = l
 		}
 	}
-	btnTotal := 0
+	btnW := 0
 	for _, b := range buttons {
-		btnTotal += len([]rune(b)) + 4
+		if w := len([]rune(b)) + 4; w > btnW {
+			btnW = w
+		}
 	}
-	w := maxLine
-	if btnTotal > w {
-		w = btnTotal
-	}
-	w += 8
+	w := maxLine + btnW + 10
 	if w < 32 {
 		w = 32
 	}
 	if w > 72 {
 		w = 72
 	}
-	h := len(lines) + 7
+	h := len(lines) + 6
+	if n := len(buttons)*2 + 4; n > h {
+		h = n
+	}
 	if h < 8 {
 		h = 8
 	}
-
-	frame := dlgNewFrame(title, body)
-	return frame, w, h
+	d.SetSize(w, h)
+	return d
 }
 
-// dlgSearchOpts builds a Find/Replace form with the shared option checkboxes.
-// It returns the form plus accessors for the entered values.
-func dlgSearchForm() *tview.Form {
-	form := tview.NewForm()
-	dlgStyleForm(form)
-	return form
-}
+// NewFindDialog builds the modal Find dialog: a "Find What" input, "Match case"
+// and "Whole word" checkboxes, and Find Next / Cancel buttons. onFind receives
+// the query and option flags; onCancel fires on Cancel/Esc.
+func NewFindDialog(initial string, onFind func(query string, matchCase, wholeWord bool), onCancel func()) *Dialog {
+	d := NewDialog("Find")
+	d.SetSize(50, 11)
 
-// dlgCheckboxState returns whether the named checkbox in form is ticked.
-func dlgCheckboxState(form *tview.Form, label string) bool {
-	if item := form.GetFormItemByLabel(label); item != nil {
-		if cb, ok := item.(*tview.Checkbox); ok {
-			return cb.IsChecked()
+	find := d.AddField("Find What ", initial, 30)
+	matchCase := d.AddCheckbox("Match case", false)
+	wholeWord := d.AddCheckbox("Whole word", false)
+
+	cancel := func() {
+		if onCancel != nil {
+			onCancel()
 		}
 	}
-	return false
-}
-
-// dlgInputValue returns the trimmed text of the named input in form.
-func dlgInputValue(form *tview.Form, label string) string {
-	if item := form.GetFormItemByLabel(label); item != nil {
-		if in, ok := item.(*tview.InputField); ok {
-			return in.GetText()
-		}
-	}
-	return ""
-}
-
-// NewFindDialog builds the modal Find dialog: a "Find What" input, "Match
-// case" and "Whole word" checkboxes, and Find Next / Cancel buttons. onFind
-// receives the query and option flags; onCancel fires on Cancel/Esc.
-func NewFindDialog(initial string, onFind func(query string, matchCase, wholeWord bool), onCancel func()) (tview.Primitive, int, int) {
-	form := dlgSearchForm()
-	form.AddInputField("Find What", initial, 40, nil, nil)
-	form.AddCheckbox("Match case", false, nil)
-	form.AddCheckbox("Whole word", false, nil)
-	form.AddButton("Find Next", func() {
+	d.SetCancel(cancel)
+	findBtn := d.AddButton("Find Next", func() {
 		if onFind != nil {
-			onFind(dlgInputValue(form, "Find What"),
-				dlgCheckboxState(form, "Match case"),
-				dlgCheckboxState(form, "Whole word"))
+			onFind(find.GetText(), matchCase.IsChecked(), wholeWord.IsChecked())
 		}
 	})
-	form.AddButton("Cancel", func() {
-		if onCancel != nil {
-			onCancel()
-		}
-	})
-	form.SetCancelFunc(func() {
-		if onCancel != nil {
-			onCancel()
-		}
-	})
-
-	body := tview.NewFlex().SetDirection(tview.FlexRow)
-	body.SetBackgroundColor(theme.LGray)
-	body.AddItem(form, 0, 1, true)
-
-	frame := dlgNewFrame("Find", body)
-	return frame, 50, 10
+	d.AddButton("Cancel", cancel)
+	d.SetDefault(findBtn)
+	return d
 }
 
 // NewReplaceDialog builds the modal Replace dialog: "Find What" and "Replace
 // With" inputs, "Match case" and "Whole word" checkboxes, and Replace /
 // Replace All / Cancel buttons. onReplace receives both strings, the option
 // flags and whether "all" was requested; onCancel fires on Cancel/Esc.
-func NewReplaceDialog(onReplace func(find, replace string, matchCase, wholeWord, all bool), onCancel func()) (tview.Primitive, int, int) {
-	form := dlgSearchForm()
-	form.AddInputField("Find What", "", 40, nil, nil)
-	form.AddInputField("Replace With", "", 40, nil, nil)
-	form.AddCheckbox("Match case", false, nil)
-	form.AddCheckbox("Whole word", false, nil)
-	fire := func(all bool) {
-		if onReplace != nil {
-			onReplace(dlgInputValue(form, "Find What"),
-				dlgInputValue(form, "Replace With"),
-				dlgCheckboxState(form, "Match case"),
-				dlgCheckboxState(form, "Whole word"),
-				all)
+func NewReplaceDialog(onReplace func(find, replace string, matchCase, wholeWord, all bool), onCancel func()) *Dialog {
+	d := NewDialog("Replace")
+	d.SetSize(54, 13)
+
+	find := d.AddField("Find What    ", "", 30)
+	repl := d.AddField("Replace With ", "", 30)
+	matchCase := d.AddCheckbox("Match case", false)
+	wholeWord := d.AddCheckbox("Whole word", false)
+
+	cancel := func() {
+		if onCancel != nil {
+			onCancel()
 		}
 	}
-	form.AddButton("Replace", func() { fire(false) })
-	form.AddButton("Replace All", func() { fire(true) })
-	form.AddButton("Cancel", func() {
-		if onCancel != nil {
-			onCancel()
-		}
-	})
-	form.SetCancelFunc(func() {
-		if onCancel != nil {
-			onCancel()
-		}
-	})
+	d.SetCancel(cancel)
 
-	body := tview.NewFlex().SetDirection(tview.FlexRow)
-	body.SetBackgroundColor(theme.LGray)
-	body.AddItem(form, 0, 1, true)
-
-	frame := dlgNewFrame("Replace", body)
-	return frame, 52, 12
+	fire := func(all bool) {
+		if onReplace != nil {
+			onReplace(find.GetText(), repl.GetText(),
+				matchCase.IsChecked(), wholeWord.IsChecked(), all)
+		}
+	}
+	replBtn := d.AddButton("Replace", func() { fire(false) })
+	d.AddButton("Replace All", func() { fire(true) })
+	d.AddButton("Cancel", cancel)
+	d.SetDefault(replBtn)
+	return d
 }
 
-// NewGotoLineDialog builds the modal Go To Line dialog: a numeric "Line
-// Number" input with OK / Cancel buttons. onOK receives the parsed line
-// number (only when a positive integer was entered); onCancel fires on
-// Cancel/Esc.
-func NewGotoLineDialog(onOK func(line int), onCancel func()) (tview.Primitive, int, int) {
-	form := tview.NewForm()
-	dlgStyleForm(form)
-	form.AddInputField("Line Number", "", 12, func(textToCheck string, lastChar rune) bool {
+// NewGotoLineDialog builds the modal Go To Line dialog: a numeric "Line Number"
+// input with OK / Cancel buttons. onOK receives the parsed line number (only
+// when a positive integer was entered); onCancel fires on Cancel/Esc.
+func NewGotoLineDialog(onOK func(line int), onCancel func()) *Dialog {
+	d := NewDialog("Go To Line")
+	d.SetSize(40, 8)
+
+	in := d.AddField("Line Number ", "", 12)
+	in.SetAcceptanceFunc(func(textToCheck string, lastChar rune) bool {
 		return lastChar >= '0' && lastChar <= '9'
-	}, nil)
-	form.AddButton("OK", func() {
-		v := strings.TrimSpace(dlgInputValue(form, "Line Number"))
+	})
+
+	cancel := func() {
+		if onCancel != nil {
+			onCancel()
+		}
+	}
+	d.SetCancel(cancel)
+	okBtn := d.AddButton("OK", func() {
+		v := strings.TrimSpace(in.GetText())
 		if n, err := strconv.Atoi(v); err == nil && n > 0 && onOK != nil {
 			onOK(n)
 		}
 	})
-	form.AddButton("Cancel", func() {
-		if onCancel != nil {
-			onCancel()
-		}
-	})
-	form.SetCancelFunc(func() {
-		if onCancel != nil {
-			onCancel()
-		}
-	})
-
-	body := tview.NewFlex().SetDirection(tview.FlexRow)
-	body.SetBackgroundColor(theme.LGray)
-	body.AddItem(form, 0, 1, true)
-
-	frame := dlgNewFrame("Go To Line", body)
-	return frame, 40, 8
+	d.AddButton("Cancel", cancel)
+	d.SetDefault(okBtn)
+	return d
 }
 
 // Options holds the user-configurable editor preferences shown in the Options
@@ -884,68 +904,50 @@ type Options struct {
 	LineNumbers bool
 }
 
-// NewOptionsDialog builds the modal Options/Preferences dialog: a "Line
-// Numbers" checkbox (seeded from cur) with OK / Cancel buttons. OK reads the
-// checkbox's current state and calls onOK with the resulting Options; onCancel
-// fires on Cancel/Esc.
-func NewOptionsDialog(cur Options, onOK func(Options), onCancel func()) (tview.Primitive, int, int) {
-	form := tview.NewForm()
-	dlgStyleForm(form)
-	form.AddCheckbox("Line Numbers", cur.LineNumbers, nil)
-	form.AddButton("OK", func() {
+// NewOptionsDialog builds the modal Options dialog: a "Line Numbers" checkbox
+// (seeded from cur) with OK / Cancel buttons. OK reads the checkbox state and
+// calls onOK; onCancel fires on Cancel/Esc.
+func NewOptionsDialog(cur Options, onOK func(Options), onCancel func()) *Dialog {
+	d := NewDialog("Options")
+	d.SetSize(40, 9)
+
+	lineNums := d.AddCheckbox("Line Numbers", cur.LineNumbers)
+
+	cancel := func() {
+		if onCancel != nil {
+			onCancel()
+		}
+	}
+	d.SetCancel(cancel)
+	okBtn := d.AddButton("OK", func() {
 		if onOK != nil {
-			onOK(Options{LineNumbers: dlgCheckboxState(form, "Line Numbers")})
+			onOK(Options{LineNumbers: lineNums.IsChecked()})
 		}
 	})
-	form.AddButton("Cancel", func() {
-		if onCancel != nil {
-			onCancel()
-		}
-	})
-	form.SetCancelFunc(func() {
-		if onCancel != nil {
-			onCancel()
-		}
-	})
-
-	body := tview.NewFlex().SetDirection(tview.FlexRow)
-	body.SetBackgroundColor(theme.LGray)
-	body.AddItem(form, 0, 1, true)
-
-	frame := dlgNewFrame("Options", body)
-	return frame, 40, 9
+	d.AddButton("Cancel", cancel)
+	d.SetDefault(okBtn)
+	return d
 }
 
 // NewAboutDialog builds the modal About box with product credits and a single
 // OK button. onOK fires on OK or Esc.
-func NewAboutDialog(onOK func()) (tview.Primitive, int, int) {
+func NewAboutDialog(onOK func()) *Dialog {
 	const about = "DOSEdit\n\nA terminal text editor in the style of\nVisual Basic for DOS 1.0 / QuickBASIC 4.5\n\nBuilt with Go, tcell and tview."
 
-	tv := tview.NewTextView()
-	tv.SetText(about)
+	d := NewDialog("About DOSEdit")
+	d.SetSize(46, 14)
+
+	tv := d.AddTextLine(about)
 	tv.SetWrap(true)
 	tv.SetTextAlign(tview.AlignCenter)
-	tv.SetTextStyle(theme.DialogBody())
-	tv.SetBackgroundColor(theme.LGray)
 
-	form := tview.NewForm()
-	dlgStyleForm(form)
-	form.AddButton("OK", func() {
+	ok := func() {
 		if onOK != nil {
 			onOK()
 		}
-	})
-	form.SetCancelFunc(func() {
-		if onOK != nil {
-			onOK()
-		}
-	})
-
-	body := tview.NewFlex().SetDirection(tview.FlexRow)
-	body.SetBackgroundColor(theme.LGray)
-	body.AddItem(tv, 0, 1, false)
-	body.AddItem(form, 1, 0, true)
-
-	frame := dlgNewFrame("About DOSEdit", body)
-	return frame, 46, 14
+	}
+	d.SetCancel(ok)
+	okBtn := d.AddButton("OK", ok)
+	d.SetDefault(okBtn)
+	return d
 }

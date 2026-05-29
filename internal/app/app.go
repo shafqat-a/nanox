@@ -1,40 +1,43 @@
 // Package app wires DOSEdit's UI primitives, window management, command
 // dispatch and global key routing into a runnable tview application (spec §6.1,
-// §7, §8, Appendix A). It owns the application loop, the desktop / menu bar /
-// status bar, the set of MDI editor windows, and the modal-dialog overlay.
+// §7, §8, Appendix A).
+//
+// Focus architecture: a single root primitive, UIManager (ui_manager.go), is
+// the sole tview-focused primitive and routes ALL keyboard and mouse input via
+// a derived scope (DIALOG / MENU / WINDOWS). The App owns the collaborators
+// (window manager, menu bar, status bar), the set of MDI editor windows and the
+// command tree; it installs the WINDOWS-scope accelerator hook and the dialog
+// push/pop flows on the UIManager. There is no app-level SetInputCapture /
+// SetMouseCapture, no modal overlay layer and no winman dependency — the
+// UIManager replaces all of that.
 package app
 
 import (
+	"fmt"
+
 	"dosedit/internal/buffer"
 	"dosedit/internal/ui"
+	"dosedit/internal/ui/wm"
 
-	"github.com/epiclabs-io/winman"
-	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 )
-
-// modalPageName is the tview.Pages page used to host a centred modal dialog
-// over the main layout.
-const modalPageName = "modal"
-
-// mainPageName is the tview.Pages page hosting the master row layout.
-const mainPageName = "main"
 
 // App holds the whole running application's state and collaborators.
 type App struct {
 	tapp      *tview.Application
-	desktop   *ui.Desktop
+	wm        *wm.Manager
 	menubar   *ui.MenuBar
 	statusbar *ui.StatusBar
+	ui        *UIManager
 
-	root  *tview.Flex  // menu / desktop / status row layout
-	pages *tview.Pages // main layout + modal overlay
-
-	windows []*ui.EditorWindow
-	active  *ui.EditorWindow
+	// windows is the App's bookkeeping list of MDI editor windows, parallel to
+	// the window manager's z-order but kept in creation order so Alt+1..9 and the
+	// dirty-prompt walks are stable. editorOf maps each window to its editor.
+	windows  []*wm.Window
+	editorOf map[*wm.Window]*ui.Editor
+	numberOf map[*wm.Window]int
 
 	nextWindowNumber int
-	modalOpen        bool
 	moveSize         bool // keyboard move/size mode active (Ctrl+F5)
 
 	// lineNumbers is the app-wide preference for showing line numbers in editor
@@ -45,82 +48,50 @@ type App struct {
 	lineNumbers bool
 
 	// placed records windows already sized against real desktop geometry, so a
-	// window created before the first layout (when the manager's inner rect is
-	// still a tview default) is re-sized once on first activation.
-	placed map[*ui.EditorWindow]bool
+	// window created before the first layout (when the manager's rect is still a
+	// tview default) is re-sized once on first activation.
+	placed map[*wm.Window]bool
 }
 
 // New constructs an App over the supplied collaborators, builds the menu bar
-// from its own command tree and assembles the root layout and modal-overlay
-// pages. The first editor window is opened separately via OpenInitialWindow so
-// the layout has been installed before a window is focused.
-func New(tapp *tview.Application, desktop *ui.Desktop, statusbar *ui.StatusBar) *App {
+// from its own command tree and assembles the root UIManager. The first editor
+// window is opened separately via OpenInitialWindow so the layout has run before
+// a window is focused.
+func New(tapp *tview.Application, manager *wm.Manager, statusbar *ui.StatusBar) *App {
 	a := &App{
 		tapp:             tapp,
-		desktop:          desktop,
+		wm:               manager,
 		statusbar:        statusbar,
+		editorOf:         map[*wm.Window]*ui.Editor{},
+		numberOf:         map[*wm.Window]int{},
 		nextWindowNumber: 1,
-		placed:           map[*ui.EditorWindow]bool{},
+		placed:           map[*wm.Window]bool{},
 	}
 
 	// BuildMenus closes over the App's command methods, so the bar can be built
 	// only after the App value exists.
 	a.menubar = ui.NewMenuBar(a.BuildMenus())
-	menubar := a.menubar
 
-	a.root = tview.NewFlex().SetDirection(tview.FlexRow).
-		AddItem(menubar, 1, 0, false).
-		AddItem(desktop.Primitive(), 0, 1, true).
-		AddItem(statusbar, 1, 0, false)
+	a.ui = NewUIManager(manager, a.menubar, statusbar)
+	a.ui.SetGlobalKey(a.routeGlobalKey)
 
-	a.pages = tview.NewPages()
-	a.pages.AddPage(mainPageName, a.root, true, true)
-
-	// When the menu bar closes, return focus to the active editor and reset
-	// the status-bar context.
-	menubar.SetOnClose(func() {
-		a.statusbar.SetContext(ui.CtxEditing)
-		a.focusActiveEditor()
-	})
-
-	// When the menu bar becomes active (keyboard or mouse), switch the status
-	// bar to the menu context.
-	menubar.SetOnActivate(func() {
+	// Keep the UIManager's menu scope in sync with the bar, and drive the status
+	// bar context off the bar's transitions.
+	a.menubar.SetOnActivate(func() {
 		a.statusbar.SetContext(ui.CtxMenu)
+		a.ui.SyncMenuActive()
 	})
-
-	// Mouse support for the menu bar. The open dropdown is drawn below row 0 and
-	// thus outside the MenuBar primitive's rect, so tview's per-primitive routing
-	// never delivers dropdown clicks to it. Capture mouse events at the app level
-	// and hit-test them against the bar in absolute coordinates. Only events the
-	// menu actually handles are swallowed; everything else passes through so
-	// winman window drag/resize and the editor keep working.
-	tapp.SetMouseCapture(func(ev *tcell.EventMouse, action tview.MouseAction) (*tcell.EventMouse, tview.MouseAction) {
-		if a.modalOpen {
-			// Belt-and-suspenders: while a modal is open, swallow every mouse
-			// event at the app level so the menu bar's hit-testing never runs.
-			// The full-screen modalLayer already blocks Pages routing to the
-			// background; swallowing here guarantees the bar gets nothing.
-			return nil, action
-		}
-		x, y := ev.Position()
-		if a.menubar.HandleMouse(action, x, y) {
-			// The bar consumed it. If it became active, give it keyboard focus so
-			// arrow-key navigation takes over.
-			if a.menubar.IsActive() {
-				a.tapp.SetFocus(a.menubar)
-			}
-			return nil, action
-		}
-		return ev, action
+	a.menubar.SetOnClose(func() {
+		a.ui.SyncMenuActive()
+		a.statusbar.SetContext(ui.CtxEditing)
 	})
 
 	return a
 }
 
-// Root returns the top-level primitive to install via SetRoot (the pages
-// container so modal dialogs can overlay the main layout).
-func (a *App) Root() tview.Primitive { return a.pages }
+// Root returns the top-level primitive to install via SetRoot (the UIManager,
+// which is also the sole focus target).
+func (a *App) Root() tview.Primitive { return a.ui }
 
 // OpenInitialWindow opens the single untitled editor window the app starts
 // with, focused. Call after the root layout is installed.
@@ -139,144 +110,135 @@ func (a *App) SetLineNumbersDefault(on bool) {
 func (a *App) setLineNumbers(on bool) {
 	a.lineNumbers = on
 	for _, w := range a.windows {
-		w.Editor().SetLineNumbers(on)
+		a.editorOf[w].SetLineNumbers(on)
 	}
 	a.tapp.Draw()
 }
 
 // --- window lifecycle ------------------------------------------------------
 
-// newEditorWindow builds an editor window over buf, wires its callbacks and
-// adds it to the desktop. The new window becomes the active window.
-func (a *App) newEditorWindow(buf *buffer.Buffer) *ui.EditorWindow {
+// newEditorWindow builds an editor window over buf, wires its callbacks and adds
+// it to the window manager. The new window becomes active.
+func (a *App) newEditorWindow(buf *buffer.Buffer) *wm.Window {
 	ed := ui.NewEditor(buf)
 	ed.SetLineNumbers(a.lineNumbers)
 	number := a.nextWindowNumber
 	a.nextWindowNumber++
 
-	var w *ui.EditorWindow
-	w = ui.NewEditorWindow(a.desktop, ed, number,
-		func() { a.closeWindow(w) },
-		func() { w.ToggleMaximize() },
-	)
+	w := wm.NewWindow(ed, "")
+	a.editorOf[w] = ed
+	a.numberOf[w] = number
+
+	w.SetOnClose(func() { a.closeWindowPrompt(w, func() { a.closeWindow(w) }) })
+	w.SetOnToggleMax(func() { /* manager already toggled; redraw on next loop */ })
 
 	// Cursor moves drive the status bar (1-based ln/col + INS/OVR).
 	ed.SetOnCursorMove(func(ln, col int, ins bool) {
 		a.statusbar.SetCursor(ln, col, ins)
-		if !a.menubar.IsActive() && !a.modalOpen {
+		if a.ui.currentScope() == scopeWindows {
 			a.statusbar.SetContext(ui.CtxEditing)
 		}
 	})
 	// Buffer changes refresh the title and dirty indicator.
 	ed.SetOnChange(func() {
-		w.Update()
+		a.updateTitle(w)
 		a.statusbar.SetModified(ed.Buffer().Modified)
 	})
 
 	a.windows = append(a.windows, w)
+	a.wm.Add(w)
 	a.activate(w)
 	return w
 }
 
-// activate makes w the active (focused, top-most) window and updates the
-// status bar to reflect its editor state.
-func (a *App) activate(w *ui.EditorWindow) {
+// updateTitle formats and applies w's title: "[n] name" with a leading "*" on
+// the name when the buffer is modified.
+func (a *App) updateTitle(w *wm.Window) {
+	ed := a.editorOf[w]
+	name := ed.Buffer().DisplayName()
+	if ed.Buffer().Modified {
+		name = "*" + name
+	}
+	w.SetTitle(fmt.Sprintf("[%d] %s", a.numberOf[w], name))
+}
+
+// activate raises w to the top of the z-order, makes it active and refreshes the
+// status bar from its editor state.
+func (a *App) activate(w *wm.Window) {
 	if w == nil {
 		return
 	}
-	a.active = w
 	a.placeWindow(w)
-	a.desktop.Manager().SetZ(w, winman.WindowZTop)
-	if !a.modalOpen && !a.menubar.IsActive() {
-		a.tapp.SetFocus(w)
+	a.wm.Activate(w)
+	a.updateTitle(w)
+	ed := a.editorOf[w]
+	a.statusbar.SetModified(ed.Buffer().Modified)
+	if a.ui.currentScope() == scopeWindows {
 		a.statusbar.SetContext(ui.CtxEditing)
 	}
-	w.Update()
-	a.statusbar.SetModified(w.Editor().Buffer().Modified)
-	ed := w.Editor()
-	// Re-emit the cursor position for the freshly focused editor.
-	ed.SetOnCursorMove(func(ln, col int, ins bool) {
-		a.statusbar.SetCursor(ln, col, ins)
-		if !a.menubar.IsActive() && !a.modalOpen {
-			a.statusbar.SetContext(ui.CtxEditing)
-		}
-	})
 }
 
 // placeWindow gives w a sensible cascaded rect sized to ~2/3 of the desktop.
 //
-// Windows may be created before the layout has run, when the manager's inner
-// rect is still a tview default (around 15x10). In that case we size against
-// the 80x23 reference desktop and leave w unmarked, so the next placement
-// attempt (on activation or a global key) corrects it once real geometry is
-// available. The window manager clamps any oversize rect to the real desktop on
-// each draw, so an interim reference-sized rect always renders sensibly. A
-// window is only marked placed once it has been sized against real geometry; it
-// is never moved again afterwards.
-func (a *App) placeWindow(w *ui.EditorWindow) {
+// Windows may be created before the layout has run, when the manager's rect is
+// still a tview default. In that case we size against the 80x23 reference
+// desktop and leave w unmarked, so the next placement attempt (on activation or
+// a global key) corrects it once real geometry is available. The manager clamps
+// any oversize rect to the real desktop on each draw, so an interim
+// reference-sized rect always renders sensibly. A window is only marked placed
+// once it has been sized against real geometry; it is never moved again after.
+func (a *App) placeWindow(w *wm.Window) {
 	if a.placed[w] {
 		return
 	}
-	dx, dy, dw, dh := a.desktop.Manager().GetInnerRect()
+	dx, dy, dw, dh := a.wm.GetRect()
 	real := dw >= 40 && dh >= 15
 	if !real {
-		// Not laid out yet: use the 80x23 reference desktop.
+		// Not laid out yet: use the 80x23 reference desktop (rows 1..23).
 		dx, dy, dw, dh = 0, 1, 80, 23
 	}
 	ww := dw * 2 / 3
 	wh := dh * 2 / 3
-	if ww < winman.MinWindowWidth {
-		ww = winman.MinWindowWidth
+	if ww < wm.MinWindowWidth {
+		ww = wm.MinWindowWidth
 	}
-	if wh < winman.MinWindowHeight {
-		wh = winman.MinWindowHeight
+	if wh < wm.MinWindowHeight {
+		wh = wm.MinWindowHeight
 	}
-	off := ((w.Number() - 1) % 6) * 2
+	off := ((a.numberOf[w] - 1) % 6) * 2
 	w.SetRect(dx+off, dy+off, ww, wh)
 	if real {
 		a.placed[w] = true
 	}
 }
 
-// focusActiveEditor returns keyboard focus to the active editor window (or the
-// desktop if there are none).
-func (a *App) focusActiveEditor() {
-	if a.modalOpen {
-		return
-	}
-	if a.active != nil {
-		a.tapp.SetFocus(a.active)
-		return
-	}
-	a.tapp.SetFocus(a.desktop.Primitive())
-}
+// activeWindow returns the manager's active window, or nil.
+func (a *App) activeWindow() *wm.Window { return a.wm.Active() }
 
-// closeWindow removes w from the desktop and the window list, then activates a
-// remaining window if any. Callers that need a dirty-prompt should route
-// through cmdCloseWindow instead.
-func (a *App) closeWindow(w *ui.EditorWindow) {
+// closeWindow removes w from the manager and the bookkeeping list, then
+// activates a remaining window if any. Callers that need a dirty-prompt should
+// route through cmdCloseActive / closeWindowPrompt instead.
+func (a *App) closeWindow(w *wm.Window) {
 	if w == nil {
 		return
 	}
-	a.desktop.Manager().RemoveWindow(w)
+	a.wm.Remove(w)
 	for i, x := range a.windows {
 		if x == w {
 			a.windows = append(a.windows[:i], a.windows[i+1:]...)
 			break
 		}
 	}
-	if a.active == w {
-		a.active = nil
-	}
-	if len(a.windows) > 0 {
-		a.activate(a.windows[len(a.windows)-1])
-	} else {
-		a.focusActiveEditor()
+	delete(a.editorOf, w)
+	delete(a.numberOf, w)
+	delete(a.placed, w)
+	if cur := a.wm.Active(); cur != nil {
+		a.activate(cur)
 	}
 }
 
-// windowIndex returns the position of w in the window slice, or -1.
-func (a *App) windowIndex(w *ui.EditorWindow) int {
+// windowIndex returns the position of w in the bookkeeping slice, or -1.
+func (a *App) windowIndex(w *wm.Window) int {
 	for i, x := range a.windows {
 		if x == w {
 			return i
@@ -287,22 +249,23 @@ func (a *App) windowIndex(w *ui.EditorWindow) int {
 
 // cycleWindow activates the next (dir>0) or previous (dir<0) window.
 func (a *App) cycleWindow(dir int) {
-	n := len(a.windows)
-	if n == 0 {
+	if len(a.windows) == 0 {
 		return
 	}
-	i := a.windowIndex(a.active)
-	if i < 0 {
-		i = 0
+	if dir < 0 {
+		a.wm.Prev()
+	} else {
+		a.wm.Next()
 	}
-	i = (i + dir + n) % n
-	a.activate(a.windows[i])
+	if cur := a.wm.Active(); cur != nil {
+		a.activate(cur)
+	}
 }
 
 // activateByNumber activates the window whose MDI number is num (Alt+1..9).
 func (a *App) activateByNumber(num int) {
 	for _, w := range a.windows {
-		if w.Number() == num {
+		if a.numberOf[w] == num {
 			a.activate(w)
 			return
 		}
@@ -313,93 +276,22 @@ func (a *App) activateByNumber(num int) {
 
 // cascadeWindows lays the windows out in an overlapping cascade.
 func (a *App) cascadeWindows() {
-	dx, dy, dw, dh := a.desktop.Manager().GetInnerRect()
-	if dw <= 0 || dh <= 0 {
-		return
+	for _, w := range a.windows {
+		a.placed[w] = true
 	}
-	ww := dw * 2 / 3
-	wh := dh * 2 / 3
-	if ww < winman.MinWindowWidth {
-		ww = winman.MinWindowWidth
-	}
-	if wh < winman.MinWindowHeight {
-		wh = winman.MinWindowHeight
-	}
-	for i, w := range a.windows {
-		if w.IsMaximized() {
-			w.Restore()
-		}
-		off := (i % 6) * 2
-		w.SetRect(dx+off, dy+off, ww, wh)
-	}
-	if a.active != nil {
-		a.activate(a.active)
+	a.wm.Cascade()
+	if cur := a.wm.Active(); cur != nil {
+		a.activate(cur)
 	}
 }
 
 // tileWindows lays the windows out in a non-overlapping grid (F5).
 func (a *App) tileWindows() {
-	n := len(a.windows)
-	if n == 0 {
-		return
+	for _, w := range a.windows {
+		a.placed[w] = true
 	}
-	dx, dy, dw, dh := a.desktop.Manager().GetInnerRect()
-	if dw <= 0 || dh <= 0 {
-		return
+	a.wm.Tile()
+	if cur := a.wm.Active(); cur != nil {
+		a.activate(cur)
 	}
-	// Choose a near-square grid.
-	cols := 1
-	for cols*cols < n {
-		cols++
-	}
-	rows := (n + cols - 1) / cols
-	cw := dw / cols
-	ch := dh / rows
-	if cw < winman.MinWindowWidth {
-		cw = winman.MinWindowWidth
-	}
-	if ch < winman.MinWindowHeight {
-		ch = winman.MinWindowHeight
-	}
-	for i, w := range a.windows {
-		if w.IsMaximized() {
-			w.Restore()
-		}
-		c := i % cols
-		r := i / cols
-		w.SetRect(dx+c*cw, dy+r*ch, cw, ch)
-	}
-	if a.active != nil {
-		a.activate(a.active)
-	}
-}
-
-// --- modal overlay ---------------------------------------------------------
-
-// showModal centres prim (sized w×h) over the main layout, blocks the windows
-// beneath it and gives it focus. The status bar switches to the dialog context.
-//
-// prim is wrapped in a full-screen modalLayer added as the modal page (with
-// resize=true so it always fills the screen). The layer centres prim in a w×h
-// sub-rect and consumes every mouse event outside it, so clicks on background
-// windows or the menu bar are dead — the dialog is truly modal. Focus is given
-// to prim itself so its internal Tab focus-group works.
-func (a *App) showModal(prim tview.Primitive, w, h int) {
-	a.modalOpen = true
-	a.statusbar.SetContext(ui.CtxDialog)
-
-	layer := newModalLayer(prim, w, h)
-	a.pages.AddPage(modalPageName, layer, true, true)
-	a.tapp.SetFocus(prim)
-}
-
-// closeModal removes the modal overlay and restores focus to the active editor.
-func (a *App) closeModal() {
-	if !a.modalOpen {
-		return
-	}
-	a.pages.RemovePage(modalPageName)
-	a.modalOpen = false
-	a.statusbar.SetContext(ui.CtxEditing)
-	a.focusActiveEditor()
 }

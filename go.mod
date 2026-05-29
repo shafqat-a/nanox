@@ -8,7 +8,6 @@ require (
 )
 
 require (
-	github.com/epiclabs-io/winman v0.0.0-20220901164457-3d8c4b3ae090 // indirect
 	github.com/gdamore/encoding v1.0.1 // indirect
 	github.com/lucasb-eyer/go-colorful v1.3.0 // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect

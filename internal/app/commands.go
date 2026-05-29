@@ -1,6 +1,12 @@
 // commands.go implements DOSEdit's menu tree and the File / Edit / Search /
 // Window / Help command actions (spec §7). Menu actions and global keys both
 // funnel through the cmd* methods here.
+//
+// Dialogs are shown by pushing a *ui.Dialog onto the UIManager's dialog stack
+// (a.ui.PushDialog); the dialog's onOK/onCancel callbacks pop it back off
+// (a.ui.PopDialog) and then perform the work. The UIManager makes the dialog
+// truly modal (it owns all input and swallows background clicks), so commands
+// here never touch focus directly.
 package app
 
 import (
@@ -10,15 +16,14 @@ import (
 
 	"dosedit/internal/buffer"
 	"dosedit/internal/ui"
+	"dosedit/internal/ui/wm"
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 )
 
 // BuildMenus constructs the full menu tree (closing over the App's commands)
-// and returns it for ui.NewMenuBar. main.go builds the menu bar from this and
-// passes it to New; we re-attach the same menus here so the bar's actions and
-// the App agree.
+// and returns it for ui.NewMenuBar.
 func (a *App) BuildMenus() []*ui.Menu {
 	windowMenu := &ui.Menu{Title: "Window", Mnemonic: 'W', Items: []ui.MenuItem{
 		{Label: "Next", Mnemonic: 'N', Accel: "F6", Action: func() { a.cycleWindow(1) }},
@@ -73,24 +78,27 @@ func (a *App) BuildMenus() []*ui.Menu {
 	}
 }
 
-// activeEditor returns the focused window's editor, or nil if no windows.
+// activeEditor returns the active window's editor, or nil if no windows.
 func (a *App) activeEditor() *ui.Editor {
-	if a.active == nil {
+	w := a.activeWindow()
+	if w == nil {
 		return nil
 	}
-	return a.active.Editor()
+	return a.editorOf[w]
 }
 
 // editKey forwards a synthetic key event to the active editor's InputHandler
 // (used for Edit-menu clipboard/undo commands the editor already implements).
 func (a *App) editKey(ev *tcell.EventKey) {
-	if a.active == nil {
+	w := a.activeWindow()
+	if w == nil {
 		return
 	}
-	if h := a.active.Editor().InputHandler(); h != nil {
+	ed := a.editorOf[w]
+	if h := ed.InputHandler(); h != nil {
 		h(ev, func(p tview.Primitive) {})
 	}
-	a.active.Update()
+	a.updateTitle(w)
 }
 
 // startDir returns a sensible starting directory for file dialogs.
@@ -111,9 +119,9 @@ func (a *App) startDir() string {
 func (a *App) cmdNew() { a.newEditorWindow(buffer.NewUntitled()) }
 
 func (a *App) cmdOpen() {
-	prim, w, h := ui.NewOpenDialog(a.startDir(), "*.*",
+	d := ui.NewOpenDialog(a.startDir(), "*.*",
 		func(path string) {
-			a.closeModal()
+			a.ui.PopDialog()
 			buf, err := buffer.Load(path)
 			if err != nil {
 				a.showMessage("Open Failed", fmt.Sprintf("Cannot open\n%s\n\n%v", path, err), []string{"OK"}, nil)
@@ -121,9 +129,9 @@ func (a *App) cmdOpen() {
 			}
 			a.newEditorWindow(buf)
 		},
-		func() { a.closeModal() },
+		func() { a.ui.PopDialog() },
 	)
-	a.showModal(prim, w, h)
+	a.ui.PushDialog(d)
 }
 
 // cmdSave saves the active buffer, running the Save As flow if it has no path.
@@ -135,13 +143,14 @@ func (a *App) cmdSave() {
 // (used by close/exit flows to continue once saved). If the buffer has no path
 // it runs the Save As dialog, calling done on success.
 func (a *App) saveActive(done func()) {
-	ed := a.activeEditor()
-	if ed == nil {
+	w := a.activeWindow()
+	if w == nil {
 		if done != nil {
 			done()
 		}
 		return
 	}
+	ed := a.editorOf[w]
 	buf := ed.Buffer()
 	if buf.Path == "" {
 		a.saveAsFlow(done)
@@ -151,9 +160,7 @@ func (a *App) saveActive(done func()) {
 		a.showMessage("Save Failed", fmt.Sprintf("%v", err), []string{"OK"}, nil)
 		return
 	}
-	if a.active != nil {
-		a.active.Update()
-	}
+	a.updateTitle(w)
 	a.statusbar.SetModified(buf.Modified)
 	if done != nil {
 		done()
@@ -170,14 +177,14 @@ func (a *App) saveAsFlow(done func()) {
 		return
 	}
 	suggested := ed.Buffer().DisplayName()
-	prim, w, h := ui.NewSaveAsDialog(a.startDir(), suggested,
+	d := ui.NewSaveAsDialog(a.startDir(), suggested,
 		func(path string) {
-			a.closeModal()
+			a.ui.PopDialog()
 			a.doSaveAs(path, done)
 		},
-		func() { a.closeModal() },
+		func() { a.ui.PopDialog() },
 	)
-	a.showModal(prim, w, h)
+	a.ui.PushDialog(d)
 }
 
 // doSaveAs writes the active buffer to path, prompting for overwrite if the
@@ -188,7 +195,7 @@ func (a *App) doSaveAs(path string, done func()) {
 			fmt.Sprintf("%s already exists.\nReplace it?", filepath.Base(path)),
 			[]string{"Yes", "No"},
 			func(idx int) {
-				a.closeModal()
+				a.ui.PopDialog()
 				if idx == 0 {
 					a.writeSaveAs(path, done)
 				}
@@ -199,17 +206,16 @@ func (a *App) doSaveAs(path string, done func()) {
 }
 
 func (a *App) writeSaveAs(path string, done func()) {
-	ed := a.activeEditor()
-	if ed == nil {
+	w := a.activeWindow()
+	if w == nil {
 		return
 	}
+	ed := a.editorOf[w]
 	if err := ed.Buffer().SaveAs(path); err != nil {
 		a.showMessage("Save Failed", fmt.Sprintf("%v", err), []string{"OK"}, nil)
 		return
 	}
-	if a.active != nil {
-		a.active.Update()
-	}
+	a.updateTitle(w)
 	a.statusbar.SetModified(ed.Buffer().Modified)
 	if done != nil {
 		done()
@@ -220,20 +226,20 @@ func (a *App) writeSaveAs(path string, done func()) {
 // modified buffers are left for an explicit Save As.
 func (a *App) cmdSaveAll() {
 	for _, w := range a.windows {
-		buf := w.Editor().Buffer()
+		buf := a.editorOf[w].Buffer()
 		if buf.Modified && buf.Path != "" {
 			_ = buf.Save()
-			w.Update()
+			a.updateTitle(w)
 		}
 	}
-	if a.active != nil {
-		a.statusbar.SetModified(a.active.Editor().Buffer().Modified)
+	if ed := a.activeEditor(); ed != nil {
+		a.statusbar.SetModified(ed.Buffer().Modified)
 	}
 }
 
 // cmdCloseActive closes the active window, prompting to save if dirty.
 func (a *App) cmdCloseActive() {
-	w := a.active
+	w := a.activeWindow()
 	if w == nil {
 		return
 	}
@@ -242,8 +248,8 @@ func (a *App) cmdCloseActive() {
 
 // closeWindowPrompt prompts to save a dirty buffer before running then. Yes
 // saves and proceeds; No proceeds without saving; Cancel/Esc aborts.
-func (a *App) closeWindowPrompt(w *ui.EditorWindow, then func()) {
-	buf := w.Editor().Buffer()
+func (a *App) closeWindowPrompt(w *wm.Window, then func()) {
+	buf := a.editorOf[w].Buffer()
 	if !buf.Modified {
 		then()
 		return
@@ -253,7 +259,7 @@ func (a *App) closeWindowPrompt(w *ui.EditorWindow, then func()) {
 		fmt.Sprintf("Save changes to %s?", buf.DisplayName()),
 		[]string{"Yes", "No", "Cancel"},
 		func(idx int) {
-			a.closeModal()
+			a.ui.PopDialog()
 			switch idx {
 			case 0: // Yes
 				a.saveActive(then)
@@ -274,13 +280,14 @@ func (a *App) cmdExit() {
 func (a *App) exitNext(i int) {
 	for i < len(a.windows) {
 		w := a.windows[i]
-		if w.Editor().Buffer().Modified {
+		buf := a.editorOf[w].Buffer()
+		if buf.Modified {
 			a.activate(w)
 			a.showMessage("DOSEdit",
-				fmt.Sprintf("Save changes to %s?", w.Editor().Buffer().DisplayName()),
+				fmt.Sprintf("Save changes to %s?", buf.DisplayName()),
 				[]string{"Yes", "No", "Cancel"},
 				func(idx int) {
-					a.closeModal()
+					a.ui.PopDialog()
 					switch idx {
 					case 0: // Yes: save, then continue from the same index.
 						a.saveActive(func() { a.exitNext(i + 1) })
@@ -302,7 +309,7 @@ func (a *App) exitNext(i int) {
 // movement keys: jump to the document start, then extend the selection to the
 // document end with Ctrl+Shift+End.
 func (a *App) cmdSelectAll() {
-	if a.active == nil {
+	if a.activeWindow() == nil {
 		return
 	}
 	a.editKey(tcell.NewEventKey(tcell.KeyHome, 0, tcell.ModCtrl))
@@ -313,10 +320,10 @@ func (a *App) cmdSelectAll() {
 // cmdOptions opens the Options dialog, applying changes (currently the
 // line-numbers preference) to all open editors on OK.
 func (a *App) cmdOptions() {
-	prim, w, h := ui.NewOptionsDialog(ui.Options{LineNumbers: a.lineNumbers},
-		func(opt ui.Options) { a.closeModal(); a.setLineNumbers(opt.LineNumbers) },
-		func() { a.closeModal() })
-	a.showModal(prim, w, h)
+	d := ui.NewOptionsDialog(ui.Options{LineNumbers: a.lineNumbers},
+		func(opt ui.Options) { a.ui.PopDialog(); a.setLineNumbers(opt.LineNumbers) },
+		func() { a.ui.PopDialog() })
+	a.ui.PushDialog(d)
 }
 
 // --- Search commands -------------------------------------------------------
@@ -326,16 +333,16 @@ func (a *App) cmdFind() {
 	if ed == nil {
 		return
 	}
-	prim, w, h := ui.NewFindDialog("",
+	d := ui.NewFindDialog("",
 		func(query string, matchCase, wholeWord bool) {
-			a.closeModal()
+			a.ui.PopDialog()
 			if !ed.Find(query, matchCase, wholeWord, true) {
 				a.showMessage("Find", fmt.Sprintf("\"%s\" not found.", query), []string{"OK"}, nil)
 			}
 		},
-		func() { a.closeModal() },
+		func() { a.ui.PopDialog() },
 	)
-	a.showModal(prim, w, h)
+	a.ui.PushDialog(d)
 }
 
 func (a *App) cmdFindNext() {
@@ -355,20 +362,20 @@ func (a *App) cmdReplace() {
 	if ed == nil {
 		return
 	}
-	prim, w, h := ui.NewReplaceDialog(
+	d := ui.NewReplaceDialog(
 		func(find, repl string, matchCase, wholeWord, all bool) {
 			if all {
 				n := ed.ReplaceAll(find, repl, matchCase, wholeWord)
-				a.closeModal()
+				a.ui.PopDialog()
 				a.showMessage("Replace", fmt.Sprintf("%d replacement(s) made.", n), []string{"OK"}, nil)
 				return
 			}
 			ed.Replace(find, repl, matchCase, wholeWord)
 			a.tapp.Draw()
 		},
-		func() { a.closeModal() },
+		func() { a.ui.PopDialog() },
 	)
-	a.showModal(prim, w, h)
+	a.ui.PushDialog(d)
 }
 
 func (a *App) cmdGotoLine() {
@@ -376,41 +383,31 @@ func (a *App) cmdGotoLine() {
 	if ed == nil {
 		return
 	}
-	prim, w, h := ui.NewGotoLineDialog(
+	d := ui.NewGotoLineDialog(
 		func(line int) {
-			a.closeModal()
+			a.ui.PopDialog()
 			ed.GotoLine(line)
 		},
-		func() { a.closeModal() },
+		func() { a.ui.PopDialog() },
 	)
-	a.showModal(prim, w, h)
+	a.ui.PushDialog(d)
 }
 
 // --- Window commands -------------------------------------------------------
 
 func (a *App) cmdToggleMax() {
-	if a.active != nil {
-		a.active.ToggleMaximize()
-	}
-}
-
-// cmdMoveSize puts the status bar into the move/size context. winman already
-// supports mouse drag/resize; keyboard move/size uses the arrow keys handled in
-// keys.go while this context is active.
-func (a *App) cmdMoveSize() {
-	if a.active == nil {
+	w := a.activeWindow()
+	if w == nil {
 		return
 	}
-	a.statusbar.SetContext(ui.CtxMove)
-	a.moveSize = true
-	a.focusActiveEditor()
+	w.ToggleMaximize()
 }
 
 // --- Help commands ---------------------------------------------------------
 
 func (a *App) cmdAbout() {
-	prim, w, h := ui.NewAboutDialog(func() { a.closeModal() })
-	a.showModal(prim, w, h)
+	d := ui.NewAboutDialog(func() { a.ui.PopDialog() })
+	a.ui.PushDialog(d)
 }
 
 // cmdKeys shows the key reference in a message box.
@@ -425,18 +422,29 @@ func (a *App) cmdKeys() {
 	a.showMessage("Keyboard Reference", keys, []string{"OK"}, nil)
 }
 
+// cmdMoveSize puts the status bar into the move/size context and enables the
+// keyboard arrow-key move/size mode (Ctrl+F5). The window manager already
+// supports mouse drag/resize.
+func (a *App) cmdMoveSize() {
+	if a.activeWindow() == nil {
+		return
+	}
+	a.statusbar.SetContext(ui.CtxMove)
+	a.moveSize = true
+}
+
 // --- shared message-box helper ---------------------------------------------
 
 // showMessage displays a modal message box. onResult (may be nil) receives the
-// pressed button index, or -1 on Esc; when onResult is nil the box simply
-// closes itself on any button or Esc.
+// pressed button index, or -1 on Esc; when onResult is nil the box simply pops
+// itself off the dialog stack on any button or Esc.
 func (a *App) showMessage(title, message string, buttons []string, onResult func(idx int)) {
-	prim, w, h := ui.NewMessageBox(title, message, buttons, func(idx int) {
+	d := ui.NewMessageBox(title, message, buttons, func(idx int) {
 		if onResult != nil {
 			onResult(idx)
 			return
 		}
-		a.closeModal()
+		a.ui.PopDialog()
 	})
-	a.showModal(prim, w, h)
+	a.ui.PushDialog(d)
 }

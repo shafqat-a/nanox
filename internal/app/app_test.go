@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"dosedit/internal/ui"
+	"dosedit/internal/ui/wm"
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
@@ -18,21 +19,21 @@ func newTestApp(t *testing.T) (*App, *tview.Application, tcell.SimulationScreen)
 	t.Helper()
 
 	// Do not call sim.Init here: tview.Application.Run initialises the screen
-	// itself, and initialising a SimulationScreen twice deadlocks. SetSize
-	// before SetScreen establishes the 80x25 reference geometry.
+	// itself, and initialising a SimulationScreen twice deadlocks. SetSize before
+	// SetScreen establishes the 80x25 reference geometry.
 	sim := tcell.NewSimulationScreen("")
 	sim.SetSize(80, 25)
 
 	tapp := tview.NewApplication()
 	tapp.SetScreen(sim)
 
-	desktop := ui.NewDesktop()
+	manager := wm.NewManager()
 	statusbar := ui.NewStatusBar()
-	a := New(tapp, desktop, statusbar)
+	a := New(tapp, manager, statusbar)
 	a.OpenInitialWindow()
 
-	tapp.SetInputCapture(a.RouteGlobalKeys)
 	tapp.SetRoot(a.Root(), true)
+	tapp.SetFocus(a.Root())
 	return a, tapp, sim
 }
 
@@ -45,8 +46,7 @@ func runApp(tapp *tview.Application) <-chan error {
 	return done
 }
 
-// screenText flattens the whole simulation screen into a single string so tests
-// can assert on rendered regions without caring about exact columns.
+// screenText flattens the whole simulation screen into a single string.
 func screenText(sim tcell.SimulationScreen) string {
 	cells, w, h := sim.GetContents()
 	buf := make([]rune, 0, w*h+h)
@@ -86,144 +86,12 @@ func contains(haystack, needle string) bool {
 	return strings.Contains(haystack, needle)
 }
 
-// TestM1ShellBuildsAndDraws is the M1 acceptance proof: the app assembles the
-// master layout, draws without panicking, and the menu / desktop / status
-// regions render.
-func TestM1ShellBuildsAndDraws(t *testing.T) {
-	_, tapp, sim := newTestApp(t)
-	done := runApp(tapp)
-
-	// The loop performs an initial draw on start; poll the simulation screen
-	// until the menu bar has rendered.
-	waitFor(t, func() bool {
-		return contains(rowText(sim, 0), "File")
-	}, "menu bar to render", done)
-
-	// Row 0 is the menu bar.
-	menu := rowText(sim, 0)
-	for _, title := range []string{"File", "Edit", "Search", "Window", "Help"} {
-		if !contains(menu, title) {
-			t.Errorf("menu bar row missing %q; got %q", title, menu)
-		}
-	}
-
-	// Bottom row is the status bar (cyan context hints).
-	status := rowText(sim, 24)
-	if !contains(status, "F1=Help") {
-		t.Errorf("status bar row missing hints; got %q", status)
-	}
-
-	// The desktop region between bars should have drawn the editor window; its
-	// title appears once the loop has performed its first layout and placement.
-	waitFor(t, func() bool {
-		return contains(screenText(sim), "Untitled1")
-	}, "initial editor window to render", done)
-
-	// Alt+X must stop the app cleanly.
-	tapp.QueueEvent(tcell.NewEventKey(tcell.KeyRune, 'x', tcell.ModAlt))
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("Run returned error: %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		tapp.Stop()
-		t.Fatal("app did not stop within timeout after Alt+X")
-	}
-}
-
-// TestNewWindowCommand verifies that the File>New command path creates an
-// additional window and tracks it.
-func TestNewWindowCommand(t *testing.T) {
-	a, tapp, _ := newTestApp(t)
-	done := runApp(tapp)
-	defer func() {
-		tapp.Stop()
-		<-done
-	}()
-
-	tapp.QueueUpdateDraw(func() { a.cmdNew() })
-	waitFor(t, func() bool {
-		got := make(chan int, 1)
-		tapp.QueueUpdate(func() { got <- len(a.windows) })
-		return <-got == 2
-	}, "second window to be created", done)
-}
-
-// TestModalBlocksBackgroundMouse proves the modal-dialog fix: while a dialog is
-// open, a left-click on a background editor window (outside the centred dialog
-// rect) is absorbed by the full-screen modal layer and must NOT steal keyboard
-// focus from the dialog. Under the old Flex-sandwich modal the click fell
-// through tview.Pages to the background window and focus leaked out (which is
-// what made Tab appear broken inside dialogs).
-func TestModalBlocksBackgroundMouse(t *testing.T) {
-	a, tapp, sim := newTestApp(t)
-	tapp.EnableMouse(true)
-	done := runApp(tapp)
-	defer func() {
-		tapp.Stop()
-		<-done
-	}()
-
-	// Let the loop perform its initial draw and window placement, then open the
-	// About dialog (a single-button message box) as the modal and capture the
-	// primitive that should hold focus while it is open.
-	waitFor(t, func() bool {
-		got := make(chan bool, 1)
-		tapp.QueueUpdate(func() { got <- (len(a.windows) == 1) })
-		return <-got
-	}, "initial window to exist", done)
-
-	wantFocus := make(chan tview.Primitive, 1)
-	tapp.QueueUpdateDraw(func() {
-		a.cmdAbout()
-		wantFocus <- tapp.GetFocus()
-	})
-	dlg := <-wantFocus
-	waitFor(t, func() bool {
-		got := make(chan bool, 1)
-		tapp.QueueUpdate(func() { got <- a.modalOpen })
-		return <-got
-	}, "modal to open", done)
-
-	// Click near the top-left of the desktop (row 2, col 3) where the background
-	// editor window title bar sits — well outside the centred About dialog. With
-	// the fix the modal layer swallows it; focus must remain on the dialog.
-	sim.InjectMouse(3, 2, tcell.Button1, tcell.ModNone)
-	sim.InjectMouse(3, 2, tcell.ButtonNone, tcell.ModNone)
-
-	// Give the loop time to process the click, then assert state.
-	deadline := time.After(500 * time.Millisecond)
-	tick := time.NewTicker(20 * time.Millisecond)
-	defer tick.Stop()
-	for {
-		select {
-		case <-deadline:
-			type state struct {
-				modal   bool
-				focus   tview.Primitive
-				menuAct bool
-			}
-			got := make(chan state, 1)
-			tapp.QueueUpdate(func() {
-				got <- state{a.modalOpen, tapp.GetFocus(), a.menubar.IsActive()}
-			})
-			st := <-got
-			if !st.modal {
-				t.Fatal("modal closed after background click; should stay modal")
-			}
-			if st.menuAct {
-				t.Fatal("menu bar became active after background click; modality leaked")
-			}
-			if st.focus != dlg {
-				t.Fatalf("focus leaked out of dialog after background click: got %T, want dialog %T", st.focus, dlg)
-			}
-			return
-		case err := <-done:
-			t.Fatalf("app loop exited unexpectedly: %v", err)
-		case <-tick.C:
-		}
-	}
+// query runs fn on the tview loop and returns its result, so tests can read App
+// state without racing the loop goroutine.
+func query[T any](tapp *tview.Application, fn func() T) T {
+	got := make(chan T, 1)
+	tapp.QueueUpdate(func() { got <- fn() })
+	return <-got
 }
 
 // waitFor polls cond until it is true, failing the test on timeout. It also
@@ -244,5 +112,189 @@ func waitFor(t *testing.T, cond func() bool, what string, done <-chan error) {
 			t.Fatalf("timed out waiting for %s", what)
 		case <-tick.C:
 		}
+	}
+}
+
+// TestBootsAndExits proves the app boots to the three-region layout with one
+// Untitled window and that Alt+X stops it cleanly.
+func TestBootsAndExits(t *testing.T) {
+	_, tapp, sim := newTestApp(t)
+	done := runApp(tapp)
+
+	waitFor(t, func() bool {
+		return contains(query(tapp, func() string { return rowText(sim, 0) }), "File")
+	}, "menu bar to render", done)
+
+	menu := query(tapp, func() string { return rowText(sim, 0) })
+	for _, title := range []string{"File", "Edit", "Search", "Window", "Help"} {
+		if !contains(menu, title) {
+			t.Errorf("menu bar row missing %q; got %q", title, menu)
+		}
+	}
+
+	if status := query(tapp, func() string { return rowText(sim, 24) }); !contains(status, "F1=Help") {
+		t.Errorf("status bar row missing hints; got %q", status)
+	}
+
+	waitFor(t, func() bool {
+		return contains(query(tapp, func() string { return screenText(sim) }), "Untitled1")
+	}, "initial editor window to render", done)
+
+	// Alt+X must stop the app cleanly.
+	tapp.QueueEvent(tcell.NewEventKey(tcell.KeyRune, 'x', tcell.ModAlt))
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		tapp.Stop()
+		t.Fatal("app did not stop within timeout after Alt+X")
+	}
+}
+
+// TestNewWindowCommand verifies File>New creates an additional window.
+func TestNewWindowCommand(t *testing.T) {
+	a, tapp, _ := newTestApp(t)
+	done := runApp(tapp)
+	defer func() {
+		tapp.Stop()
+		<-done
+	}()
+
+	tapp.QueueUpdateDraw(func() { a.cmdNew() })
+	waitFor(t, func() bool {
+		return query(tapp, func() int { return len(a.windows) }) == 2
+	}, "second window to be created", done)
+}
+
+// TestModalBlocksBackgroundMouse proves true modality: while a dialog is open, a
+// left-click on a background editor window (outside the dialog rect) is
+// swallowed by the UIManager and must NOT change focus or the active window —
+// and the dialog must stay open.
+func TestModalBlocksBackgroundMouse(t *testing.T) {
+	a, tapp, sim := newTestApp(t)
+	tapp.EnableMouse(true)
+	done := runApp(tapp)
+	defer func() {
+		tapp.Stop()
+		<-done
+	}()
+
+	waitFor(t, func() bool {
+		return query(tapp, func() bool { return len(a.windows) == 1 })
+	}, "initial window to exist", done)
+
+	beforeActive := query(tapp, func() *wm.Window { return a.wm.Active() })
+
+	tapp.QueueUpdateDraw(func() { a.cmdAbout() })
+	waitFor(t, func() bool {
+		return query(tapp, func() bool { return a.ui.DialogOpen() })
+	}, "dialog to open", done)
+
+	// The UIManager must remain the sole tview focus throughout.
+	if f := query(tapp, func() tview.Primitive { return tapp.GetFocus() }); f != tview.Primitive(a.ui) {
+		t.Fatalf("UIManager should be the tview focus; got %T", f)
+	}
+
+	// Click the background window title bar area (row 2, col 3) — outside the
+	// centred About dialog.
+	sim.InjectMouse(3, 2, tcell.Button1, tcell.ModNone)
+	sim.InjectMouse(3, 2, tcell.ButtonNone, tcell.ModNone)
+
+	// Allow the loop to process, then assert state is unchanged.
+	deadline := time.After(500 * time.Millisecond)
+	tick := time.NewTicker(20 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		select {
+		case <-deadline:
+			type state struct {
+				dialog  bool
+				focus   tview.Primitive
+				menuAct bool
+				active  *wm.Window
+			}
+			st := query(tapp, func() state {
+				return state{a.ui.DialogOpen(), tapp.GetFocus(), a.ui.MenuActive(), a.wm.Active()}
+			})
+			if !st.dialog {
+				t.Fatal("dialog closed after background click; should stay modal")
+			}
+			if st.menuAct {
+				t.Fatal("menu bar became active after background click; modality leaked")
+			}
+			if st.focus != tview.Primitive(a.ui) {
+				t.Fatalf("focus leaked off the UIManager after background click: got %T", st.focus)
+			}
+			if st.active != beforeActive {
+				t.Fatal("active window changed after background click; modality leaked")
+			}
+			return
+		case err := <-done:
+			t.Fatalf("app loop exited unexpectedly: %v", err)
+		case <-tick.C:
+		}
+	}
+}
+
+// TestEscClosesDialog proves Esc cancels (pops) an open dialog.
+func TestEscClosesDialog(t *testing.T) {
+	a, tapp, _ := newTestApp(t)
+	done := runApp(tapp)
+	defer func() {
+		tapp.Stop()
+		<-done
+	}()
+
+	waitFor(t, func() bool {
+		return query(tapp, func() bool { return len(a.windows) == 1 })
+	}, "initial window", done)
+
+	tapp.QueueUpdateDraw(func() { a.cmdAbout() })
+	waitFor(t, func() bool {
+		return query(tapp, func() bool { return a.ui.DialogOpen() })
+	}, "dialog to open", done)
+
+	tapp.QueueEvent(tcell.NewEventKey(tcell.KeyEscape, 0, tcell.ModNone))
+	waitFor(t, func() bool {
+		return query(tapp, func() bool { return !a.ui.DialogOpen() })
+	}, "dialog to close on Esc", done)
+}
+
+// TestGlobalKeyDoesNotFireOverDialog proves a WINDOWS-scope accelerator does NOT
+// fire while a dialog is open: with the About dialog up, F3 (Open) must not push
+// a second dialog, and the keystroke is owned by the open dialog.
+func TestGlobalKeyDoesNotFireOverDialog(t *testing.T) {
+	a, tapp, _ := newTestApp(t)
+	done := runApp(tapp)
+	defer func() {
+		tapp.Stop()
+		<-done
+	}()
+
+	waitFor(t, func() bool {
+		return query(tapp, func() bool { return len(a.windows) == 1 })
+	}, "initial window", done)
+
+	tapp.QueueUpdateDraw(func() { a.cmdAbout() })
+	waitFor(t, func() bool {
+		return query(tapp, func() bool { return a.ui.DialogOpen() })
+	}, "dialog to open", done)
+
+	depthBefore := query(tapp, func() int { return len(a.ui.dialogStack) })
+
+	// F3 would open the File>Open dialog in WINDOWS scope. It must be ignored.
+	tapp.QueueEvent(tcell.NewEventKey(tcell.KeyF3, 0, tcell.ModNone))
+
+	// Give the loop time to (not) act, then assert the stack depth is unchanged
+	// and a window count of 1 (Open never ran).
+	time.Sleep(200 * time.Millisecond)
+	depthAfter := query(tapp, func() int { return len(a.ui.dialogStack) })
+	if depthAfter != depthBefore {
+		t.Fatalf("dialog stack changed (%d -> %d); a global accelerator fired over a dialog", depthBefore, depthAfter)
+	}
+	if n := query(tapp, func() int { return len(a.windows) }); n != 1 {
+		t.Fatalf("window count changed to %d; accelerator leaked over dialog", n)
 	}
 }
