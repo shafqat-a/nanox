@@ -141,13 +141,27 @@ func (a *App) dispatchKey(ev *tcell.EventKey) bool {
 	// provide Tab focus traversal within the modal's trapped ring for free.
 	if len(a.modals) > 0 {
 		top := a.modals[len(a.modals)-1]
+		// Tab/Shift+Tab move focus within the modal's trapped ring first.
+		if a.handleTab(ev) {
+			return true
+		}
+		// Enter/Esc are owned by the Dialog: Enter activates the default
+		// button and Esc invokes the cancel handler, regardless of which
+		// control is focused. This must run before the focused child so a
+		// focused Checkbox/Option does not swallow Enter by toggling.
+		if ev.Key() == tcell.KeyEnter || ev.Key() == tcell.KeyEscape {
+			if top.HandleKey(ev) {
+				a.dirty = true
+				return true
+			}
+		}
+		// All other keys go to the focused control (typing, Space toggling,
+		// arrows in OptionGroup/ListBox, etc.).
 		if a.focused != nil && a.focused.HandleKey(ev) {
 			a.dirty = true
 			return true
 		}
-		if a.handleTab(ev) {
-			return true
-		}
+		// Fall back to the modal itself for anything unhandled.
 		consumed := top.HandleKey(ev)
 		if consumed {
 			a.dirty = true
