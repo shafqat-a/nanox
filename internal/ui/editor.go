@@ -38,6 +38,13 @@ type Editor struct {
 
 	onCursorMove func(ln, col int, ins bool)
 	onChange     func()
+
+	// last-search state (for FindNext / repeat).
+	edLastQuery     string
+	edLastMatchCase bool
+	edLastWholeWord bool
+	edLastForward   bool
+	edHasSearch     bool
 }
 
 // NewEditor creates an Editor over buffer b (a fresh untitled buffer if nil).
@@ -992,4 +999,234 @@ func (e *Editor) InputHandler() func(event *tcell.EventKey, setFocus func(p tvie
 		}
 		e.edNotifyCursor()
 	})
+}
+
+// --- search / goto (integration API; appended for APP wiring) -------------
+
+// edFold returns r lowercased when not matchCase, else r unchanged.
+func edFold(r rune, matchCase bool) rune {
+	if matchCase {
+		return r
+	}
+	return unicode.ToLower(r)
+}
+
+// edRunesEqual compares two rune slices honouring case folding.
+func edRunesEqual(a, b []rune, matchCase bool) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if edFold(a[i], matchCase) != edFold(b[i], matchCase) {
+			return false
+		}
+	}
+	return true
+}
+
+// edMatchAt reports whether query matches the text of line starting at rune
+// column col, honouring case and whole-word options.
+func (e *Editor) edMatchAt(line, col int, q []rune, matchCase, wholeWord bool) bool {
+	rs := e.edLineRunes(line)
+	if col < 0 || col+len(q) > len(rs) {
+		return false
+	}
+	if !edRunesEqual(rs[col:col+len(q)], q, matchCase) {
+		return false
+	}
+	if wholeWord {
+		if col > 0 && edIsWord(rs[col-1]) {
+			return false
+		}
+		if col+len(q) < len(rs) && edIsWord(rs[col+len(q)]) {
+			return false
+		}
+	}
+	return true
+}
+
+// edFindFrom searches starting at (line,col) in the given direction for the
+// next match of q. Returns the match position and true if found.
+func (e *Editor) edFindFrom(line, col int, q []rune, matchCase, wholeWord, forward bool) (int, int, bool) {
+	if len(q) == 0 {
+		return 0, 0, false
+	}
+	n := e.buf.LineCount()
+	if forward {
+		l := line
+		c := col
+		for l < n {
+			rs := e.edLineRunes(l)
+			for c <= len(rs) {
+				if e.edMatchAt(l, c, q, matchCase, wholeWord) {
+					return l, c, true
+				}
+				c++
+			}
+			l++
+			c = 0
+		}
+	} else {
+		l := line
+		c := col
+		for l >= 0 {
+			rs := e.edLineRunes(l)
+			if c > len(rs) {
+				c = len(rs)
+			}
+			for c >= 0 {
+				if e.edMatchAt(l, c, q, matchCase, wholeWord) {
+					return l, c, true
+				}
+				c--
+			}
+			l--
+			if l >= 0 {
+				c = e.edLineLen(l)
+			}
+		}
+	}
+	return 0, 0, false
+}
+
+// edSelectMatch moves the cursor to (line,col), selects q runes from there,
+// scrolls into view and fires the cursor callback.
+func (e *Editor) edSelectMatch(line, col, qlen int) {
+	e.curLine = edClamp(line, 0, e.buf.LineCount()-1)
+	e.selAnchor = &edPos{Line: e.curLine, Col: edClamp(col, 0, e.edLineLen(e.curLine))}
+	e.curCol = edClamp(col+qlen, 0, e.edLineLen(e.curLine))
+	e.edClampCursor()
+	e.edNotifyCursor()
+}
+
+// Find searches for query from the cursor in the given direction, wrapping
+// around the document once. On success it moves the cursor to the match and
+// selects it, stores the search state for FindNext, and returns true.
+func (e *Editor) Find(query string, matchCase, wholeWord, forward bool) bool {
+	q := []rune(query)
+	if len(q) == 0 {
+		return false
+	}
+	e.edLastQuery = query
+	e.edLastMatchCase = matchCase
+	e.edLastWholeWord = wholeWord
+	e.edLastForward = forward
+	e.edHasSearch = true
+
+	// Start the search just past the current cursor (forward) or just before
+	// it (backward) so repeated finds advance.
+	var sl, sc int
+	if forward {
+		sl, sc = e.curLine, e.curCol+1
+	} else {
+		sl, sc = e.curLine, e.curCol-1
+	}
+	if l, c, ok := e.edFindFrom(sl, sc, q, matchCase, wholeWord, forward); ok {
+		e.edSelectMatch(l, c, len(q))
+		return true
+	}
+	// Wrap around from the opposite end of the document.
+	if forward {
+		sl, sc = 0, 0
+	} else {
+		sl = e.buf.LineCount() - 1
+		sc = e.edLineLen(sl)
+	}
+	if l, c, ok := e.edFindFrom(sl, sc, q, matchCase, wholeWord, forward); ok {
+		e.edSelectMatch(l, c, len(q))
+		return true
+	}
+	return false
+}
+
+// FindNext repeats the last Find using the stored query and flags.
+func (e *Editor) FindNext() bool {
+	if !e.edHasSearch {
+		return false
+	}
+	return e.Find(e.edLastQuery, e.edLastMatchCase, e.edLastWholeWord, e.edLastForward)
+}
+
+// Replace replaces the match at or after the cursor with repl. If the current
+// selection already equals a match of find at the cursor, that selection is
+// replaced; otherwise the next match (forward, wrapping) is replaced. Returns
+// true if a replacement was made.
+func (e *Editor) Replace(find, repl string, matchCase, wholeWord bool) bool {
+	q := []rune(find)
+	if len(q) == 0 {
+		return false
+	}
+	// If the current selection is exactly a match starting at its anchor,
+	// replace it in place; else find the next match first.
+	atSel := false
+	if e.edHasSelection() {
+		sl, sc, el, ec := e.edSelRange()
+		if sl == el && ec-sc == len(q) && e.edMatchAt(sl, sc, q, matchCase, wholeWord) {
+			e.curLine, e.curCol = sl, sc
+			e.edClearSelection()
+			atSel = true
+		}
+	}
+	if !atSel {
+		if l, c, ok := e.edFindFrom(e.curLine, e.curCol, q, matchCase, wholeWord, true); ok {
+			e.curLine, e.curCol = l, c
+			e.edClearSelection()
+		} else if l, c, ok := e.edFindFrom(0, 0, q, matchCase, wholeWord, true); ok {
+			e.curLine, e.curCol = l, c
+			e.edClearSelection()
+		} else {
+			return false
+		}
+	}
+	// Cursor now sits at the start of a confirmed match. Select it and replace.
+	e.selAnchor = &edPos{Line: e.curLine, Col: e.curCol}
+	e.curCol = e.curCol + len(q)
+	e.edClampCursor()
+	e.edInsertText(repl)
+	e.edHasSearch = true
+	e.edLastQuery, e.edLastMatchCase, e.edLastWholeWord, e.edLastForward = find, matchCase, wholeWord, true
+	return true
+}
+
+// ReplaceAll replaces every match of find with repl throughout the document
+// and returns the number of replacements made.
+func (e *Editor) ReplaceAll(find, repl string, matchCase, wholeWord bool) int {
+	q := []rune(find)
+	if len(q) == 0 {
+		return 0
+	}
+	count := 0
+	e.curLine, e.curCol = 0, 0
+	e.edClearSelection()
+	for {
+		l, c, ok := e.edFindFrom(e.curLine, e.curCol, q, matchCase, wholeWord, true)
+		if !ok {
+			break
+		}
+		e.curLine, e.curCol = l, c
+		e.selAnchor = &edPos{Line: l, Col: c}
+		e.curCol = c + len(q)
+		e.edClampCursor()
+		e.edInsertText(repl)
+		count++
+		// edInsertText leaves the cursor just past the inserted text; continue.
+	}
+	if count > 0 {
+		e.edNotifyChange()
+	}
+	return count
+}
+
+// GotoLine moves the cursor to the start of 1-based line n, clamped to the
+// document, and scrolls it into view.
+func (e *Editor) GotoLine(n int) {
+	line := edClamp(n-1, 0, e.buf.LineCount()-1)
+	e.curLine = line
+	e.curCol = 0
+	e.edClearSelection()
+	// Centre the target line in the view when possible.
+	rows := e.edPageRows()
+	e.topLine = edMax(0, line-rows/2)
+	e.edClampCursor()
+	e.edNotifyCursor()
 }
