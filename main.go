@@ -11,6 +11,7 @@ import (
 	"os"
 
 	"dosedit/internal/app"
+	"dosedit/internal/gallery"
 	"dosedit/internal/ui"
 	"dosedit/internal/ui/wm"
 
@@ -29,7 +30,12 @@ func main() {
 // any error can be reported with a non-zero exit code.
 func run() error {
 	lineNumbersFlag := flag.Bool("line-numbers", false, "show line numbers in editor windows")
+	galleryFlag := flag.Bool("gallery", false, "show the widget gallery demo and exit")
 	flag.Parse()
+
+	if *galleryFlag {
+		return gallery.Run()
+	}
 
 	tapp := tview.NewApplication()
 	tapp.EnableMouse(true)
