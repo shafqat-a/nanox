@@ -45,6 +45,12 @@ func clickAt(tapp *tui.App, x, y int) {
 	tapp.Sync()
 }
 
+// moveTo feeds a bare cursor move (no buttons held) and re-renders.
+func moveTo(tapp *tui.App, x, y int) {
+	tapp.HandleEvent(tcell.NewEventMouse(x, y, tcell.ButtonNone, 0))
+	tapp.Sync()
+}
+
 func screenText(sim tcell.SimulationScreen) string {
 	cells, w, h := sim.GetContents()
 	var b strings.Builder
@@ -146,6 +152,23 @@ func TestEnterPressesDefaultButton(t *testing.T) {
 	key(tapp, tcell.KeyEnter, '\r', tcell.ModNone)
 	if tapp.ModalDepth() != 0 {
 		t.Fatalf("Enter (default OK) did not close the dialog; depth=%d", tapp.ModalDepth())
+	}
+}
+
+// TestMenuStaysOpenOnMouseMove guards the regression where a bare cursor move
+// (tcell reports motion with no buttons) was translated to a click-release and
+// dismissed an open menu. Moving the mouse without clicking must keep it open.
+func TestMenuStaysOpenOnMouseMove(t *testing.T) {
+	tapp, _ := newTestApp(t)
+
+	key(tapp, tcell.KeyRune, 'f', tcell.ModAlt) // open the File menu
+	if tapp.ModalDepth() != 1 {
+		t.Fatalf("File menu did not open on Alt+F; depth=%d", tapp.ModalDepth())
+	}
+	moveTo(tapp, 1, 6)   // hover off the dropdown
+	moveTo(tapp, 40, 12) // hover elsewhere
+	if tapp.ModalDepth() != 1 {
+		t.Fatalf("menu closed on a no-click mouse move; depth=%d", tapp.ModalDepth())
 	}
 }
 

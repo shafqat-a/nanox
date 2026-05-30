@@ -13,7 +13,16 @@ type App struct {
 	keyHook func(ev *tcell.EventKey) bool
 	dirty   bool
 	running bool
+
+	// prevButtons holds the primary-button mask from the previous mouse event,
+	// used to derive press/release/move/drag transitions (tcell reports a bare
+	// position on every motion, including with no buttons held).
+	prevButtons tcell.ButtonMask
 }
+
+// mouseButtons masks the physical buttons (Button1..Button8), excluding the
+// wheel bits, so a no-button motion is distinguishable from a press/release.
+const mouseButtons = tcell.ButtonMask(0xff)
 
 // NewApp returns an App bound to screen.
 func NewApp(screen tcell.Screen) *App {
@@ -225,7 +234,7 @@ func (a *App) handleTab(ev *tcell.EventKey) bool {
 // dispatchMouse implements the mouse routing rules. Returns true if consumed.
 func (a *App) dispatchMouse(ev *tcell.EventMouse) bool {
 	x, y := ev.Position()
-	me := translateMouse(ev, x, y)
+	me := a.translateMouse(ev, x, y)
 
 	layer := a.TopLayer()
 	if layer == nil {
@@ -251,19 +260,37 @@ func (a *App) dispatchMouse(ev *tcell.EventMouse) bool {
 	return consumed
 }
 
-// translateMouse converts a tcell mouse event into the toolkit's MouseEvent.
-func translateMouse(ev *tcell.EventMouse, x, y int) MouseEvent {
+// translateMouse converts a tcell mouse event into the toolkit's MouseEvent,
+// deriving press/release/move/drag from the transition since the previous event.
+// tcell emits an event on every cursor MOVE (with no buttons held), so a bare
+// position change must map to MouseMove — not MouseUp — otherwise hover would be
+// read as a click release (which would, e.g., dismiss an open menu).
+func (a *App) translateMouse(ev *tcell.EventMouse, x, y int) MouseEvent {
 	btn := ev.Buttons()
 	me := MouseEvent{X: x, Y: y, Button: btn}
-	switch {
-	case btn&tcell.WheelUp != 0:
+
+	// Wheel events are momentary and carry no persistent button state.
+	if btn&tcell.WheelUp != 0 {
 		me.Action = WheelUp
-	case btn&tcell.WheelDown != 0:
+		return me
+	}
+	if btn&tcell.WheelDown != 0 {
 		me.Action = WheelDown
-	case btn&tcell.ButtonMask(0xff) != 0:
+		return me
+	}
+
+	cur := btn & mouseButtons
+	prev := a.prevButtons & mouseButtons
+	a.prevButtons = btn
+	switch {
+	case cur != 0 && prev == 0:
 		me.Action = MouseDown
-	default:
+	case cur == 0 && prev != 0:
 		me.Action = MouseUp
+	case cur != 0: // button held across events => drag
+		me.Action = MouseDrag
+	default: // no buttons, no transition => hover/move
+		me.Action = MouseMove
 	}
 	return me
 }
