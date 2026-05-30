@@ -1,8 +1,8 @@
 // Command dosedit is a single static terminal text editor recreating the
 // early-1990s Visual Basic for DOS 1.0 / QuickBASIC 4.5 editor (see CLAUDE.md
-// and VBDOS-Editor-Spec.pdf). main wires the screen, palette, custom UI
-// primitives, MDI window manager and global key router, then runs the tview
-// application loop (spec §6.1, Appendix A).
+// and VBDOS-Editor-Spec.pdf). main wires a tcell screen, the tui toolkit App
+// (menu bar, MDI desktop, status bar) and the global key router, then runs the
+// event loop.
 package main
 
 import (
@@ -12,10 +12,10 @@ import (
 
 	"dosedit/internal/app"
 	"dosedit/internal/gallery"
-	"dosedit/internal/ui"
-	"dosedit/internal/ui/wm"
+	"dosedit/internal/theme"
+	"dosedit/internal/tui"
 
-	"github.com/rivo/tview"
+	"github.com/gdamore/tcell/v2"
 )
 
 func main() {
@@ -25,9 +25,8 @@ func main() {
 	}
 }
 
-// run assembles and runs the application. It is split out from main so the
-// terminal is always restored (tview.Application.Run does this on return) and
-// any error can be reported with a non-zero exit code.
+// run assembles and runs the application. The terminal is always restored via
+// screen.Fini on return.
 func run() error {
 	lineNumbersFlag := flag.Bool("line-numbers", false, "show line numbers in editor windows")
 	galleryFlag := flag.Bool("gallery", false, "show the widget gallery demo and exit")
@@ -37,24 +36,26 @@ func run() error {
 		return gallery.Run()
 	}
 
-	tapp := tview.NewApplication()
-	tapp.EnableMouse(true)
+	screen, err := tcell.NewScreen()
+	if err != nil {
+		return err
+	}
+	if err := screen.Init(); err != nil {
+		return err
+	}
+	defer screen.Fini()
+	screen.EnableMouse()
+	screen.SetStyle(theme.Desktop())
+	screen.Clear()
 
-	manager := wm.NewManager()
-	statusbar := ui.NewStatusBar()
+	tapp := tui.NewApp(screen)
 
-	// The menu bar needs the App's command actions, and the App needs the menu
-	// bar. Construct the App first (it builds the bar and the root UIManager),
-	// set the line-numbers default, then open the first window.
-	a := app.New(tapp, manager, statusbar)
+	// New builds the menu bar (from its command tree), the root layout (menu bar /
+	// desktop / status bar) and installs the key hook. Set the line-numbers default
+	// before the first window, then open it focused.
+	a := app.New(tapp)
 	a.SetLineNumbersDefault(*lineNumbersFlag)
 	a.OpenInitialWindow()
 
-	// The UIManager is the sole root primitive AND the sole tview focus: it
-	// routes all keyboard and mouse input by scope. No SetInputCapture /
-	// SetMouseCapture is installed.
-	tapp.SetRoot(a.Root(), true)
-	tapp.SetFocus(a.Root())
-
-	return tapp.Run()
+	return a.Run()
 }

@@ -1,30 +1,28 @@
-// keys.go implements DOSEdit's WINDOWS-scope global accelerators (spec §8). The
-// accelerator table is installed on the UIManager as its globalKey hook (see
-// NewUIManager / SetGlobalKey). The UIManager only calls it in WINDOWS scope, so
-// accelerators never fire while a dialog or menu owns input — that gating lives
-// in the router, not here. routeGlobalKey returns true when it consumes the
-// event; otherwise the UIManager forwards the key to the active editor so
-// ordinary typing and the editor's own chords (Ctrl+C/V/X/Z/Y, arrows,
-// Home/End, …) still work.
+// keys.go implements DOSEdit's global accelerators (spec §8) as the tui.App's
+// key hook. The App consults the hook ONLY when no modal (dialog or menu
+// dropdown) is open and BEFORE the focused widget, so accelerators never fire
+// over a dialog/menu. routeGlobalKey returns true when it consumes the event;
+// otherwise the App forwards the key to the focused editor so ordinary typing
+// and the editor's own chords (Ctrl+C/V/X/Z/Y, arrows, Home/End, …) still work.
 //
 // F3 vs Find Next conflict (spec §7): F3 = Open, Find Next = Ctrl+L.
+//
+// Tab handling: the App's Tab/Backtab normally does focus traversal. In the
+// editing context Tab must INDENT the editor instead, so the hook forwards
+// Tab/Backtab to the active editor and consumes them (returns true) so the App's
+// traversal does not run. (Inside dialogs the hook is not consulted, so the
+// App's modal Tab-trap handles Tab normally.)
 package app
 
 import (
-	"dosedit/internal/ui"
+	"dosedit/internal/tui"
 
 	"github.com/gdamore/tcell/v2"
 )
 
-// routeGlobalKey is the WINDOWS-scope accelerator handler. It returns true if it
-// consumed ev.
+// routeGlobalKey is the global accelerator hook installed via tui.App.SetKeyHook.
+// It returns true if it consumed ev.
 func (a *App) routeGlobalKey(ev *tcell.EventKey) bool {
-	// Correct any windows still sized against the reference desktop now that the
-	// real layout geometry is available.
-	for _, w := range a.windows {
-		a.placeWindow(w)
-	}
-
 	key := ev.Key()
 	mod := ev.Modifiers()
 	ctrl := mod&tcell.ModCtrl != 0
@@ -37,6 +35,20 @@ func (a *App) routeGlobalKey(ev *tcell.EventKey) bool {
 		if a.handleMoveSize(ev) {
 			return true
 		}
+	}
+
+	// Tab/Backtab in the editing context must indent the editor, not traverse
+	// focus. Forward to the active editor and consume.
+	if key == tcell.KeyTab || key == tcell.KeyBacktab {
+		if ed := a.activeEditor(); ed != nil {
+			ed.HandleKey(ev)
+			if w := a.activeWindow(); w != nil {
+				a.updateTitle(w)
+			}
+			a.app.Redraw()
+			return true
+		}
+		return false
 	}
 
 	switch key {
@@ -67,7 +79,7 @@ func (a *App) routeGlobalKey(ev *tcell.EventKey) bool {
 		if ctrl {
 			a.cmdToggleMax()
 		} else {
-			a.ui.OpenMenu()
+			a.menubar.Activate()
 		}
 		return true
 	case tcell.KeyF4:
@@ -82,8 +94,8 @@ func (a *App) routeGlobalKey(ev *tcell.EventKey) bool {
 		a.cmdFindNext()
 		return true
 	case tcell.KeyCtrlH:
-		// Ctrl+H also arrives as Backspace on some terminals; we give the Replace
-		// command priority per the spec accelerator table.
+		// Ctrl+H also arrives as Backspace on some terminals; the spec accelerator
+		// table gives Replace priority.
 		a.cmdReplace()
 		return true
 	case tcell.KeyCtrlG:
@@ -106,14 +118,12 @@ func (a *App) routeGlobalKey(ev *tcell.EventKey) bool {
 		// Alt+F/E/S/W/H = open the matching menu.
 		if r := ev.Rune(); r != 0 {
 			if a.menubar.OpenByMnemonic(r) {
-				a.ui.SyncMenuActive()
-				a.statusbar.SetContext(ui.CtxMenu)
 				return true
 			}
 		}
 		// Plain Alt (no rune) opens the menu bar.
 		if ev.Rune() == 0 {
-			a.ui.OpenMenu()
+			a.menubar.Activate()
 			return true
 		}
 	}
@@ -122,8 +132,8 @@ func (a *App) routeGlobalKey(ev *tcell.EventKey) bool {
 }
 
 // handleMoveSize implements keyboard window move/resize while moveSize is on.
-// Returns true if the event was consumed. It drives the window manager's
-// MoveActive / ResizeActive helpers (Ctrl+F5 mode).
+// Returns true if the event was consumed. It drives the desktop's MoveActive /
+// ResizeActive helpers (Ctrl+F5 mode).
 func (a *App) handleMoveSize(ev *tcell.EventKey) bool {
 	if a.activeWindow() == nil {
 		a.moveSize = false
@@ -133,34 +143,36 @@ func (a *App) handleMoveSize(ev *tcell.EventKey) bool {
 	switch ev.Key() {
 	case tcell.KeyLeft:
 		if shift {
-			a.wm.ResizeActive(-1, 0)
+			a.desktop.ResizeActive(-1, 0)
 		} else {
-			a.wm.MoveActive(-1, 0)
+			a.desktop.MoveActive(-1, 0)
 		}
 	case tcell.KeyRight:
 		if shift {
-			a.wm.ResizeActive(1, 0)
+			a.desktop.ResizeActive(1, 0)
 		} else {
-			a.wm.MoveActive(1, 0)
+			a.desktop.MoveActive(1, 0)
 		}
 	case tcell.KeyUp:
 		if shift {
-			a.wm.ResizeActive(0, -1)
+			a.desktop.ResizeActive(0, -1)
 		} else {
-			a.wm.MoveActive(0, -1)
+			a.desktop.MoveActive(0, -1)
 		}
 	case tcell.KeyDown:
 		if shift {
-			a.wm.ResizeActive(0, 1)
+			a.desktop.ResizeActive(0, 1)
 		} else {
-			a.wm.MoveActive(0, 1)
+			a.desktop.MoveActive(0, 1)
 		}
 	case tcell.KeyEnter, tcell.KeyEscape:
 		a.moveSize = false
-		a.statusbar.SetContext(ui.CtxEditing)
+		a.statusbar.SetContext(tui.CtxEditing)
+		a.app.Redraw()
 		return true
 	default:
 		return false
 	}
+	a.app.Redraw()
 	return true
 }

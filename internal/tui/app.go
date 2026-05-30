@@ -120,6 +120,23 @@ func (a *App) Run() error {
 	return nil
 }
 
+// ModalDepth returns the number of open modal layers (0 when none). Useful for
+// tests and for code that needs to know whether a dialog/menu owns input.
+func (a *App) ModalDepth() int { return len(a.modals) }
+
+// HandleEvent dispatches a single event synchronously, without the blocking
+// PollEvent loop. It is intended for tests and embedding: callers feed events
+// and call Sync to render, all on one goroutine, so reads of the screen never
+// race the Run loop.
+func (a *App) HandleEvent(ev tcell.Event) { a.dispatch(ev) }
+
+// Sync lays out and draws one frame immediately on the calling goroutine. Pair
+// it with HandleEvent for synchronous, race-free test drends.
+func (a *App) Sync() {
+	a.layout()
+	a.draw()
+}
+
 // dispatch routes a raw tcell event to the appropriate handler. Factored out so
 // tests can drive it without a blocking PollEvent.
 func (a *App) dispatch(ev tcell.Event) {

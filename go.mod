@@ -2,10 +2,7 @@ module dosedit
 
 go 1.26.3
 
-require (
-	github.com/gdamore/tcell/v2 v2.13.10
-	github.com/rivo/tview v0.42.0
-)
+require github.com/gdamore/tcell/v2 v2.13.10
 
 require (
 	github.com/gdamore/encoding v1.0.1 // indirect
